@@ -344,7 +344,7 @@ class SearchView(View):
         t.clear(columns=True)
         t.add_columns("Symbol", "Name", "Type", "Source")
         for i, (symbol, name, kind, source) in enumerate(rows):
-            t.add_row(Text(symbol, style="bold"), Text(name[:80]), Text(kind, style=DIM), source, key=symbol)
+            t.add_row(Text(symbol, style="bold"), Text(name), Text(kind, style=DIM), source, key=symbol)
             if symbol == selected:
                 t.move_cursor(row=i)
 

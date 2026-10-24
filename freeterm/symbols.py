@@ -111,15 +111,33 @@ async def search_symbols(hub, query, aliases, publish=None):
         name, kind = names.get(symbol, (symbol, "SECURITY"))
         rows.append((symbol, f"{name} ({alias})", kind, "alias"))
 
+    details = {}
+
     def results():
-        # Exact tickers outrank name matches; prefer descriptive names on duplicates.
-        ranked = sorted((r for r in rows if allowed(r)), key=lambda r: (rank(query, *r[:3]), r[3] == "EDGAR", -len(r[1]), r[0]))
-        seen, out = set(), []
-        for row in ranked:
-            if row[0].upper() not in seen and rank(query, *row[:3]) < 99:
-                seen.add(row[0].upper())
-                out.append(row)
-        return out[:100]
+        # Match all names, then merge metadata by symbol. A better name must not
+        # change whether an alias or the original provider result matched.
+        grouped = {}
+        for row in rows:
+            grouped.setdefault(row[0].upper(), []).append(row)
+        ranked = []
+        for symbol, candidates in grouped.items():
+            score = min(rank(query, *r[:3]) for r in candidates)
+            if score == 99 and not any(r[3] == "Yahoo" for r in candidates):
+                continue
+            best = min(candidates, key=lambda r: (r[3] == "EDGAR", -len(r[1])))
+            name, kind, source = best[1:]
+            yahoo = next((r for r in candidates if r[3] == "Yahoo"), None)
+            if yahoo and yahoo[2] != "SECURITY":
+                kind = yahoo[2]
+            detail = details.get(symbol, {})
+            if detail.get("longName"):
+                name, source = detail["longName"], "Yahoo"
+            if detail.get("quoteType"):
+                kind = canonical_type(detail["quoteType"])
+            row = (symbol, name, kind, source)
+            if allowed(row):
+                ranked.append((score, symbol, row))
+        return [row for _, _, row in sorted(ranked)[:100]]
 
     if publish:
         publish(results())
@@ -155,10 +173,20 @@ async def search_symbols(hub, query, aliases, publish=None):
             publish(results())
 
     await asyncio.gather(guarded(yahoo), guarded(edgar))
-    out = results()
-    seen = {r[0].upper() for r in out}
-    for row in rows:
-        if row[3] == "Yahoo" and allowed(row) and row[0].upper() not in seen:
-            out.append(row)
-            seen.add(row[0].upper())
-    return out[:100]
+    # One batched request, rather than one profile request per result. Search
+    # shortnames and EDGAR issuer names are often not instrument names.
+    symbols = [r[0] for r in results()]
+    if symbols:
+        def fetch_names():
+            from yfinance.data import YfData
+            response = YfData().get_raw_json(
+                "https://query1.finance.yahoo.com/v7/finance/quote",
+                params={"symbols": ",".join(sorted(symbols)), "formatted": "false"}, timeout=12)
+            return (response or {}).get("quoteResponse", {}).get("result", [])
+
+        try:
+            quotes = await hub.yf_call("search-names:v1:" + ",".join(sorted(symbols)), 86400, fetch_names)
+            details.update((r["symbol"].upper(), r) for r in quotes or [] if r.get("symbol"))
+        except Exception as exc:
+            hub.warn(f"Search names unavailable: {type(exc).__name__}")
+    return results()
