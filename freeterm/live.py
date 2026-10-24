@@ -110,6 +110,19 @@ def iex_enabled(hub) -> bool:
     return bool(hub.alpaca_ok and hub.cfg.get("iex", "enabled"))
 
 
+def set_iex(hub, mode="TOGGLE") -> str:
+    mode = mode.upper()
+    if mode not in ("ON", "OFF", "TOGGLE"):
+        raise ValueError("Use /IEX ON, /IEX OFF or /IEX TOGGLE")
+    if not hub.alpaca_ok:
+        hub.cfg.set("iex", "enabled", False)
+        if mode != "OFF":
+            raise ValueError(f"IEX overlay unavailable: {hub.alpaca_reason}. Set valid ALPACA_API_KEY/ALPACA_API_SECRET and restart.")
+    enabled = False if mode == "OFF" else True if mode == "ON" else not hub.cfg.get("iex", "enabled")
+    hub.cfg.set("iex", "enabled", enabled)
+    return f"IEX overlay {'ON' if enabled else 'OFF'} (IEX-only trades; small slice of volume)."
+
+
 async def alpaca_stream(hub, want) -> None:
     import websockets
     backoff = 2

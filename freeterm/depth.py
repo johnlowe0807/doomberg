@@ -9,10 +9,12 @@ from datetime import datetime, timezone
 import pandas as pd
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Static
 
 from .app import DIM, ET, WARN, VIEWS, View, colored, fbig, fnum
 from .charts import DEF_IV, PERIOD, RANGES
+from .options import remember_quote, name as option_name, contract, number
 
 
 # ---------------------------------------------------------------- DES
@@ -229,7 +231,8 @@ def bs_greeks(S, K, T, r, sigma, call: bool):
 
 class OmonView(View):
     FUNC = "OMON"
-    hints = "[ ] expiry  +/- strikes  greeks: local Black-Scholes on yfinance IV  ITM shaded"
+    hints = ". options commands  [ ] expiry  +/- width  c/p call/put  Enter graph contract  greeks: local"
+    view_commands_enabled = True
     refresh_secs = 30
     SIDE = ("Bid", "Ask", "Last", "Vol", "OI", "IV", "Δ", "Γ", "Θ", "ν")
 
@@ -239,47 +242,90 @@ class OmonView(View):
 
     def on_mount(self) -> None:
         self.exp_i = 0
-        self.width = int(self.app.cfg.get("options", "strikes_each_side", 12))
+        self.side = "C"
+        self.contracts = []
+        self.strikes, self.expiries, self.command_history = [], [], []
+        self.loaded_expiry = None
+        self.current_expiry = None
+        self.center, self.selected_strike = None, None
+        self.requested_expiry = self.args[0] if self.args else None
+        option = contract(self.sec)
+        if option:
+            self.sec, self.requested_expiry = option['underlying'], option['expiry']
+            self.side = option['side'][0]
+            self.center = self.selected_strike = option['strike']
+        self.width = max(1, min(100, int(self.app.cfg.get("options", "strikes_each_side", 12))))
+        self.chain_header = ''
+        self.retitle()
         super().on_mount()
 
     async def load(self) -> None:
         import yfinance as yf
         sym = self.sec
+        self.contracts = []
+        self.strikes = []
+        self.loaded_expiry = None
+        self.query_one("#chain", DataTable).clear(columns=True)
         exps = await self.hub.yf_call(f"exps:{sym}", 300, lambda: yf.Ticker(sym).options)
         if not exps:
+            self.expiries = []
             self.query_one("#hdr", Static).update(Text(f"N/A — no listed options for {sym}", style=WARN))
             return
+        self.expiries = list(exps)
+        if self.requested_expiry:
+            requested = self.requested_expiry.upper()
+            if requested in ('NEXT', 'PREV', 'FIRST', 'LAST') or requested.isdigit():
+                choices = {'NEXT': self.exp_i + 1, 'PREV': self.exp_i - 1, 'FIRST': 0, 'LAST': len(exps) - 1}
+                index = int(requested) - 1 if requested.isdigit() else max(0, min(len(exps) - 1, choices[requested]))
+                if not 0 <= index < len(exps):
+                    self.query_one('#hdr', Static).update(f'N/A — expiry index must be 1–{len(exps)}; EXP LIST shows dates')
+                    return
+                self.requested_expiry = exps[index]
+            if self.requested_expiry not in exps:
+                self.query_one('#hdr', Static).update(f'N/A — expiry {self.requested_expiry} is not listed; EXP LIST shows available dates')
+                return
+            self.exp_i = exps.index(self.requested_expiry)
+            self.requested_expiry = None
         self.exp_i = max(0, min(self.exp_i, len(exps) - 1))
         exp = exps[self.exp_i]
+        self.current_expiry = exp
         ch = await self.hub.yf_call(f"chain:{sym}:{exp}", 30, lambda: yf.Ticker(sym).option_chain(exp))
+        if ch is None or all(frame is None or frame.empty for frame in (ch.calls, ch.puts)):
+            self.chain_header = f'{sym} expiry {exp} — N/A: Yahoo returned no quoted contracts; EXP NEXT / REFRESH'
+            self.render_header()
+            return
         qs = await self.hub.quotes([sym, "^IRX"])
         S = qs[sym].price if sym in qs else None
         irx = qs.get("^IRX")
         r = irx.price / 100 if irx and irx.price else float(self.app.cfg.get("options", "risk_free_fallback", 0.045))
         exp_dt = pd.Timestamp(exp).tz_localize(ET) + pd.Timedelta(hours=16)
         T = max((exp_dt - pd.Timestamp.now(tz=ET)).total_seconds(), 60) / (365 * 86400)
-        hdr = Text(f"{sym} spot {fnum(S)}  expiry {exp} ({self.exp_i + 1}/{len(exps)})  DTE {T * 365:.1f}  r {r * 100:.2f}% (^IRX)",
-                   style="bold #FFFFFF")
-        self.query_one("#hdr", Static).update(hdr)
-        if ch is None:
-            return
-        calls = ch.calls.set_index("strike")
-        puts = ch.puts.set_index("strike")
+        self.chain_header = f"{sym} spot {fnum(S)}  expiry {exp} ({self.exp_i + 1}/{len(exps)})  DTE {T * 365:.1f}  r {r * 100:.2f}%"
+        self.render_header()
+        calls = (ch.calls if ch.calls is not None else pd.DataFrame(columns=['strike'])).set_index("strike")
+        puts = (ch.puts if ch.puts is not None else pd.DataFrame(columns=['strike'])).set_index("strike")
         strikes = sorted(set(calls.index) | set(puts.index))
-        if S:
-            atm = min(range(len(strikes)), key=lambda i: abs(strikes[i] - S))
+        center = self.center if self.center is not None else S
+        if center is not None and strikes:
+            atm = min(range(len(strikes)), key=lambda i: abs(strikes[i] - center))
             strikes = strikes[max(0, atm - self.width): atm + self.width + 1]
+        else:
+            strikes = strikes[:2 * self.width + 1]
+        self.strikes = strikes
         t = self.query_one("#chain", DataTable)
         t.clear(columns=True)
         t.add_columns(*[f"C {c}" for c in reversed(self.SIDE)], "STRIKE", *[f"P {c}" for c in self.SIDE])
         for k in strikes:
             row = []
+            contracts = {}
             for side, df, is_call in (("C", calls, True), ("P", puts, False)):
                 if k in df.index:
                     o = df.loc[k]
                     o = o.iloc[0] if isinstance(o, pd.DataFrame) else o
-                    iv = float(o.get("impliedVolatility") or 0)
-                    g = bs_greeks(S, k, T, r, iv, is_call) if iv > 0.001 else None
+                    contracts[side] = o.get("contractSymbol")
+                    remember_quote(self.hub, o)
+                    iv = number(o.get("impliedVolatility")) or 0
+                    g = bs_greeks(S, k, T, r, iv, is_call) if S and iv > 0.001 else None
                     itm = bool(o.get("inTheMoney"))
                     sty = "on #0a2a3a" if itm else ""
                     num = lambda v, dp=2: Text("" if v is None or pd.isna(v) else fnum(float(v), dp), justify="right", style=sty)
@@ -294,25 +340,80 @@ class OmonView(View):
                 if is_call:
                     row.append(Text(fnum(k), style="bold #FFFFFF on #0B3D91", justify="center"))
             t.add_row(*row)
-        if S and t.row_count:
-            t.move_cursor(row=min(self.width, t.row_count - 1))
+            self.contracts.append(contracts)
+        self.loaded_expiry = exp
+        selected = self.selected_strike if self.selected_strike is not None else center
+        if selected is not None and t.row_count:
+            t.move_cursor(row=min(range(len(strikes)), key=lambda index: abs(strikes[index] - selected)))
+
+    def render_header(self):
+        header = Text(self.chain_header or f'{self.sec} options', style='bold #FFFFFF')
+        header.append(f"  Enter opens {'call' if self.side == 'C' else 'put'} chart · Yahoo DLY", style=DIM)
+        self.query_one('#hdr', Static).update(header)
+
+    def invalidate_chain(self):
+        self.contracts, self.strikes, self.loaded_expiry = [], [], None
+        self.chain_header = ''
+        self.query_one('#chain', DataTable).clear()
+        self.query_one('#hdr', Static).update(f'{self.sec} — loading selected options chain…')
+
+    def selected_contract(self, strike=None, side=None):
+        table = self.query_one('#chain', DataTable)
+        if self.loaded_expiry is None or not self.contracts:
+            raise ValueError('Chain is still loading / unavailable; retry after it loads')
+        row = table.cursor_row
+        if strike is not None:
+            row = next((i for i, value in enumerate(self.strikes) if abs(value - strike) < 1e-7), None)
+            if row is None:
+                raise ValueError('Strike is outside the displayed window; use STRIKE price first')
+        symbol = self.contracts[row].get(side or self.side) if 0 <= row < len(self.contracts) else None
+        if not symbol:
+            raise ValueError('No contract on the selected side of this strike')
+        return symbol
+
+    def on_data_table_row_highlighted(self, event):
+        row = event.data_table.cursor_row
+        if 0 <= row < len(self.strikes):
+            self.selected_strike = self.strikes[row]
+
+    def execute_graph_command(self, line):
+        from .option_commands import execute
+        return execute(self, line)
+
+    def open_graph_commands(self):
+        from .graph_commands import GraphCommandScreen
+        self.app.push_screen(GraphCommandScreen(self))
 
     def on_key(self, e) -> None:
         k = e.character
         if k in ("[", "]"):
             self.exp_i = max(0, self.exp_i + (1 if k == "]" else -1))
+            self.requested_expiry = None
+            self.invalidate_chain()
         elif k in ("+", "=", "-"):
-            self.width = max(3, self.width + (4 if k != "-" else -4))
+            self.width = max(1, min(100, self.width + (4 if k != "-" else -4)))
+        elif k in ("c", "p"):
+            self.side = k.upper()
+            self.render_header()
+            e.stop()
+            return
         else:
             return
         e.stop()
         self.reload()
 
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        event.stop()
+        try:
+            self.app.run_command(self.selected_contract())
+        except ValueError as error:
+            self.hub.warn(str(error))
+
 
 # ---------------------------------------------------------------- search
 class SearchView(View):
     FUNC = "SEARCH"
-    hints = "Enter open  /? text _t=TYPE  (EQUITY, FUTURE, CRYPTO, CURRENCY, ETF, INDEX, MUTUALFUND)"
+    hints = "Enter open  /?? filters/help  _s=symbol _n=name _t=type _p=source"
 
     @property
     def title(self) -> str:
@@ -352,4 +453,15 @@ class SearchView(View):
         self.app.run_command(e.row_key.value)
 
 
-VIEWS.update({"DES": DesView, "HP": HpView, "CN": CnView, "TOP": NewsView, "OMON": OmonView, "SEARCH": SearchView})
+class SearchHelpView(View):
+    FUNC = "SEARCH HELP"
+    hints = "Up/Down scroll  Esc back  /? text search"
+
+    def compose(self):
+        from .symbols import SEARCH_HELP
+        with VerticalScroll():
+            yield Static(SEARCH_HELP, markup=False)
+
+
+VIEWS.update({"DES": DesView, "HP": HpView, "CN": CnView, "TOP": NewsView, "OMON": OmonView, "SEARCH": SearchView,
+              "SEARCHHELP": SearchHelpView})

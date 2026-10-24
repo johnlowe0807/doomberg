@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import re
+import shlex
 
 
 def normalized(text):
@@ -17,6 +18,7 @@ TYPE_ALIASES = {
     "FX": "CURRENCY", "FOREX": "CURRENCY", "CURRENCIES": "CURRENCY",
     "INDICES": "INDEX", "INDEXES": "INDEX", "ETFS": "ETF",
     "MUTUALFUNDS": "MUTUALFUND", "MUTUAL FUND": "MUTUALFUND",
+    "OPTIONS": "OPTION",
 }
 
 
@@ -25,24 +27,62 @@ def canonical_type(value):
     return TYPE_ALIASES.get(value, value)
 
 
-def parse_search(query):
-    """Only standalone _key=value tokens are filters; ordinary terms stay literal."""
+SEARCH_HELP = """Security search · /? text [filters]
+Every displayed column can be filtered:
+_s= symbol contains · _n= name contains · _t= type · _p= source/provider
+Types: EQUITY (STOCK), FUTURE, CRYPTOCURRENCY (CRYPTO), CURRENCY (FX),
+INDEX, ETF, MUTUALFUND, OPTION (OPTIONS), SECURITY.
+Sources: local, alias, Yahoo, EDGAR. OPTION discovery uses Yahoo.
+Filters combine with AND; comma-separated values within a filter use OR.
+Matching ignores case. Quote values containing spaces: _n="natural gas".
+/? oil _t=FUTURE _s=CL · /? _t=ETF _n=bond · /? apple _p=Yahoo
+/? AAPL _t=OPTION · /? AAPL 2026-12-18 _t=OPTION
+Option discovery is bounded to one underlying/expiry and 100 nearby contracts.
+Filter-only searches browse the local catalog; text searches also query Yahoo/EDGAR.
+Results are limited to 100 matching securities. /?? displays this page.
+"""
+
+
+def parse_filters(query, keys):
+    """Parse standalone, single-letter filters, retaining quoted multiword values."""
     words, filters = [], {}
-    for token in query.split():
+    for token in shlex.split(query):
         match = re.fullmatch(r"_([a-zA-Z][a-zA-Z0-9_]*)=(.*)", token)
         if not match:
             words.append(token)
             continue
         key, value = match.groups()
         key = key.lower()
-        if key != "t":
-            raise ValueError(f"Unknown search filter _{key}; use _t=TYPE")
-        if not value or not re.fullmatch(r"[a-zA-Z]+", value):
-            raise ValueError("Type filter needs a type, e.g. _t=FUTURE or _t=CRYPTO")
-        if key in filters:
-            raise ValueError("Use one _t=TYPE filter per search")
-        filters[key] = canonical_type(value)
+        if key not in keys:
+            raise ValueError(f"Unknown search filter _{key}; available: " + " ".join(f"_{k}=" for k in keys))
+        if key in filters or not value or any(not v.strip() for v in value.split(',')):
+            raise ValueError(f"Supply one nonempty _{key}= value; separate alternatives with commas")
+        filters[key] = value
     return " ".join(words), filters
+
+
+def matches_filters(row, filters, columns, exact=()):
+    for key, wanted in filters.items():
+        actual = str(row[columns[key]]).casefold()
+        values = [v.strip().casefold() for v in wanted.split(',')]
+        if not any(actual == value if key in exact else value in actual for value in values):
+            return False
+    return True
+
+
+def parse_search(query):
+    """Only standalone _key=value tokens are filters; ordinary terms stay literal."""
+    query, filters = parse_filters(query, "sntp")
+    if "t" in filters:
+        values = [canonical_type(value) for value in filters["t"].split(',')]
+        if any(v not in {"EQUITY", "FUTURE", "CRYPTOCURRENCY", "CURRENCY", "INDEX", "ETF", "MUTUALFUND", "OPTION", "SECURITY"} for v in values):
+            raise ValueError("Unknown security type; /?? lists supported values")
+        if "OPTION" in values and len(values) > 1:
+            raise ValueError("Search OPTION separately from other types")
+        filters["t"] = ','.join(values)
+    if "p" in filters and any(v.strip().upper() not in {"LOCAL", "ALIAS", "YAHOO", "EDGAR"} for v in filters["p"].split(',')):
+        raise ValueError("Source must be local, alias, Yahoo or EDGAR; use /?? for help")
+    return query, filters
 
 
 def catalog():
@@ -101,9 +141,17 @@ async def search_symbols(hub, query, aliases, publish=None):
 
     query, filters = parse_search(query)
     wanted_type = filters.get("t")
+    from .options import contract, search as search_options
+    if wanted_type == "OPTION":
+        rows = await search_options(hub, query, aliases)
+        rows = [row for row in rows if matches_filters(row, filters, {"s": 0, "n": 1, "t": 2, "p": 3}, ("t", "p"))]
+        if publish:
+            publish(rows)
+        return rows
 
     def allowed(row):
-        return wanted_type is None or canonical_type(row[2]) == wanted_type
+        kind = "OPTION" if contract(row[0]) else canonical_type(row[2])
+        return kind != "OPTION"
 
     rows = catalog()
     names = {s: (n, ty) for s, n, ty, _ in rows}
@@ -113,7 +161,7 @@ async def search_symbols(hub, query, aliases, publish=None):
 
     details = {}
 
-    def results():
+    def results(apply_filters=True):
         # Match all names, then merge metadata by symbol. A better name must not
         # change whether an alias or the original provider result matched.
         grouped = {}
@@ -135,7 +183,7 @@ async def search_symbols(hub, query, aliases, publish=None):
             if detail.get("quoteType"):
                 kind = canonical_type(detail["quoteType"])
             row = (symbol, name, kind, source)
-            if allowed(row):
+            if allowed(row) and (not apply_filters or matches_filters(row, filters, {"s": 0, "n": 1, "t": 2, "p": 3}, ("t", "p"))):
                 ranked.append((score, symbol, row))
         return [row for _, _, row in sorted(ranked)[:100]]
 
@@ -158,7 +206,7 @@ async def search_symbols(hub, query, aliases, publish=None):
         return found or []
 
     async def edgar():
-        if not query or wanted_type not in (None, "EQUITY"):
+        if not query or (wanted_type and "EQUITY" not in wanted_type.split(',')):
             return
         tickers = await edgar_tickers(hub)
         rows.extend((s, n, "EQUITY", "EDGAR") for s, (_, n) in tickers.items()
@@ -175,7 +223,7 @@ async def search_symbols(hub, query, aliases, publish=None):
     await asyncio.gather(guarded(yahoo), guarded(edgar))
     # One batched request, rather than one profile request per result. Search
     # shortnames and EDGAR issuer names are often not instrument names.
-    symbols = [r[0] for r in results()]
+    symbols = [r[0] for r in results(False)]
     if symbols:
         def fetch_names():
             from yfinance.data import YfData

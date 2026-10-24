@@ -15,7 +15,7 @@ from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Static
 
 from .app import DIM, WARN, VIEWS, View, MonView, PromptScreen, fbig, fnum, colored, tag_text
-from .charts import QuoteChartView, fred, PALETTE
+from .charts import QuoteChartView, HomePreview, fred, PALETTE
 from .data import Quote, RateLimiter, _sub
 from .pixelcharts import ChartSurface, Panel, Scene, Trace
 
@@ -271,7 +271,7 @@ class HomeView(View):
             with Vertical():
                 yield Static("WATCHLIST", classes="msg")
                 yield MonView(self.hub, None, [])
-            yield QuoteChartView(self.hub, "^GSPC", ["3M"])
+            yield HomePreview(self.hub, "^GSPC", [])
         with Horizontal(id="home-lower"):
             with Vertical(id="home-movers"):
                 yield Static("MOVERS", id="home-movers-label", classes="msg")
@@ -463,14 +463,14 @@ class IexView(View):
         yield Static("", classes="msg")
 
     def on_mount(self) -> None:
-        cfg, hub = self.app.cfg, self.hub
-        if not hub.alpaca_ok:
-            msg = f"IEX overlay unavailable: {hub.alpaca_reason}. Set valid ALPACA_API_KEY/ALPACA_API_SECRET and restart."
-            cfg.set("iex", "enabled", False)
-        else:
-            cfg.set("iex", "enabled", not cfg.get("iex", "enabled"))
-            msg = f"IEX overlay {'ON' if cfg.get('iex', 'enabled') else 'OFF'} (IEX-only trades; small slice of volume)."
-        hub.warn(msg)
+        from .live import set_iex
+        try:
+            if len(self.args) > 1:
+                raise ValueError("Use /IEX ON, /IEX OFF or /IEX TOGGLE")
+            msg = set_iex(self.hub, self.args[0] if self.args else "TOGGLE")
+        except ValueError as error:
+            msg = str(error)
+        self.hub.warn(msg)
         self.query_one(Static).update(Text(msg, style=WARN))
 
 

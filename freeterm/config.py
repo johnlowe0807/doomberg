@@ -6,6 +6,12 @@ import os
 import tomllib
 from pathlib import Path
 
+from dotenv import load_dotenv
+
+# Resolve from the app's source so both entry points work from any working directory.
+ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(ENV_PATH, override=False)
+
 HOME = Path(os.environ.get("FREETERM_HOME", Path.home() / ".freeterm"))
 CACHE_DIR = HOME / "cache"
 CONFIG_PATH = HOME / "config.toml"
@@ -23,7 +29,8 @@ DEFAULT_CONFIG: dict = {
     },
     "chart": {
         "renderer": "auto",  # auto (Sixel/Kitty when supported), text, sixel, tgp
-        "font_px": 12,       # chart labels are independent of the terminal font
+        "font_px": 0,        # 0 follows terminal cell height; positive values override
+        "font_path": "",     # optional terminal font file for raster labels (Menlo by default on macOS)
         "type": "candle",
         "volume": True,
         "log": False,

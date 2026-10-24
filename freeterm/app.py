@@ -16,12 +16,12 @@ from rich.text import Text
 from textual import on
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal, Vertical
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Input, Static
 
 from .config import Config, load_aliases, load_watchlist, save_watchlist
-from .data import DataHub, Quote
+from .data import DataHub, Quote, RANGES, IVS, is_range, is_interval
 from .dialogs import QuitConfirm
 from .market import market_status
 
@@ -33,9 +33,10 @@ FUNCS = {
     "Q": 1, "MON": 1, "HELP": 1, "HOME": 3, "DES": 5, "GP": 2, "GIP": 2, "HP": 5, "CN": 5,
     "COMP": 8, "WEI": 3, "MOST": 3, "CMDTY": 3, "FXC": 3, "CRYPTO": 3, "TOP": 5, "OMON": 5,
     "GC": 4, "BTMM": 4, "SPRD": 4, "AUCT": 4, "FRED": 4, "FA": 6, "ERN": 6, "FIL": 6,
-    "EVTS": 6, "IEX": 7, "LAYOUT": 1, "?": 8,
+    "EVTS": 6, "IEX": 7, "LAYOUT": 1, "?": 8, "DAT": 5, "BOOK": 5,
+    "IND": 8, "CMP": 8, "MODE": 8, "TIME": 8, "SIZE": 8, "TF": 8, "??": 8, "FRED?": 4, "FRED??": 4,
 }
-SEC_FUNCS = {"Q", "DES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL"}
+SEC_FUNCS = {"Q", "DES", "FREDDES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL", "DAT", "BOOK"}
 SUFFIXES = {"US", "EQUITY", "INDEX", "CURNCY", "COMDTY", "GOVT"}
 
 
@@ -82,18 +83,30 @@ def parse(line: str, aliases: dict[str, str]):
         while rest and rest[0] in SUFFIXES:
             rest = rest[1:]
         if not rest:
+            if sec.startswith("FRED:"):
+                return "FRED", None, [sec[5:]]
             return "Q", sec, []
     if rest[0].startswith("/"):
+        fred_search = re.fullmatch(r"/FRED(\?\??)(.*)", rest[0])
+        if fred_search:
+            question, text = fred_search.groups()
+            return ("FREDSEARCHHELP" if question == "??" else "FREDSEARCH"), sec, ([text] if text else []) + rest[1:]
+        if rest[0] == "/??":
+            return "SEARCHHELP", sec, []
         if rest[0].startswith("/?"):
             query = ([rest[0][2:]] if rest[0][2:] else []) + rest[1:]
             return "SEARCH", sec, query
         func = rest[0][1:] or "HELP"
+        if func == "FRED" and len(rest) == 3 and rest[-1] == "/DES":
+            return "FREDDES", None, [rest[1]]
+        if func == 'FRED' and len(rest) == 3 and rest[1] == '/DES':
+            return 'FREDDES', None, [rest[2]]
         if func in FUNCS:
             return func, sec, rest[1:]
         close = difflib.get_close_matches(func, FUNCS, n=1, cutoff=0.6)
         hint = f" — did you mean /{close[0]}?" if close else " — use /HELP for commands"
         raise ValueError(f"Unknown command /{func}{hint}")
-    if all(re.fullmatch(r"[\^A-Z0-9.=\-]{1,12}", t) for t in rest):
+    if all(re.fullmatch(r"[\^A-Z0-9.=\-]{1,32}", t) for t in rest):
         return "COMP", sec, [aliases.get(t, t) for t in rest]   # `AAPL AMZN` = compare
     raise ValueError("Use / before a command, e.g. /GP AAPL or AAPL /GP")
 
@@ -304,26 +317,34 @@ class HelpView(View):
 FUNC_HELP = [
     ("<SEC>", "quote + chart (default screen)"), ("DES", "company profile"), ("GP", "price graph"),
     ("GIP", "intraday graph"), ("HP", "historical prices table"), ("CN", "company news"),
-    ("COMP A B C", "normalized comparison (or just: AAPL AMZN)"),
-    ("OMON", "option monitor with greeks"), ("FA", "financial statements (EDGAR XBRL)"), ("FIL", "SEC filings + reader"),
+    ("DAT [SEC] [range]", "selected-range statistics; inherits the active chart range/interval"),
+    ("BOOK [SEC]", "available order book: Coinbase depth or Yahoo best bid/ask"),
+    ("IND/CMP/TIME/SIZE/TF", "active graph commands; '.' opens the graph command popup"),
+    ("COMP A B [_fred=ID]", "mixed-source comparison; _mode=NORMALIZED|REAL|STACKED"),
+    ("OMON", "option monitor; dot commands: EXP/SIDE/STRIKE/WIDTH/OPEN/HIST/BOOK"), ("FA", "financial statements (EDGAR XBRL)"), ("FIL", "SEC filings + reader"),
     ("ERN", "earnings history + 8-K releases"), ("MON", "watchlist"), ("EVTS", "watchlist earnings calendar"),
     ("HOME", "home dashboard"), ("WEI", "world indices"), ("MOST", "movers"), ("CMDTY", "commodities"), ("FXC", "FX cross matrix"),
     ("CRYPTO", "crypto (Coinbase live)"), ("TOP", "top news (RSS)"), ("GC", "Treasury curve"), ("BTMM", "rates / money markets"),
-    ("SPRD", "IG/HY spreads + 2s10s"), ("AUCT", "Treasury auctions"), ("FRED <ID>", "chart any FRED series"),
-    ("IEX", "toggle Alpaca IEX overlay"), ("? <text> [_t=TYPE]", "search securities; filter by type, e.g. _t=FUTURE"), ("LAYOUT 1|2|4", "pane layout"), ("HELP", "this help"),
+    ("SPRD", "IG/HY spreads + 2s10s"), ("AUCT", "Treasury auctions"), ("FRED <ID>", "chart a FRED series; /DES from its graph describes it"),
+    ("FRED? <text> [filters]", "search FRED series; /FRED?? lists column filters and values"),
+    ("IEX", "toggle Alpaca IEX overlay"), ("? <text> [filters]", "search securities; /?? lists column filters and values"), ("LAYOUT 1|2|4", "pane layout"), ("HELP", "this help"),
 ]
 
 
 def help_text() -> str:
     funcs = "\n".join(f"  {(a if a == '<SEC>' else '/' + a):<16}{b}" for a, b in FUNC_HELP)
     return (
-        "Grammar: <SECURITY> [/FUNC] | /FUNC [args]     e.g.  AAPL · AAPL US /GP · /GP SPX · /COMP SPY QQQ\n"
+        "Grammar: SECURITY [/VIEW] [.COMMAND args] · /VIEW [args] · .COMMAND [args]\n"
         "Enter=GO  Esc=back  Up/Down=history  Tab=complete (command line)\n"
+        "Examples: AAPL .TIME 1Y .SIZE 2wk · AAPL /GP .IND BB · .IND RSI _p=7\n"
         "Uppercase letter starts a symbol; '/' starts a command. Both jump to the command line (':' also focuses it).\n"
+        "Options: /? AAPL _t=OPTIONS [YYYY-MM-DD] searches one expiry (nearest by default). Options are hidden in other searches.\n"
         "Tab/Shift+Tab pane focus · Ctrl+1/2/4 or /LAYOUT n · Ctrl+W close pane · Ctrl+R refresh · ? help · Ctrl+Q quit (confirm)\n\n"
         f"{funcs}\n\n"
-        "Charts: 1-9 range  [ ] interval  t type  v volume  o log  ←→ crosshair  x hide  +/- zoom  h/l pan  0 reset\n"
-        "        s SMA  e EMA  b Bollinger  w VWAP  r RSI  m MACD  p params  c compare  i IEX\n"
+        "Charts: 1-9 range  [ ] interval  t type  o log  ←→ crosshair  x hide  +/- zoom  h/l pan  0 reset\n"
+        "Graph commands: '.' popup · .IND VOLUME VWAP RSI MACD · .IND RSI MACD _p=14;12,26,9 · .CMP AAPL AMZN · .IEX ON\n"
+        "                .TIME 2Y [1d] · .SIZE 2d or 0.5y · .TF 20240101 3M · .SIZE RESET\n"
+        "Graph HELP lists commands for its type. HOME preview is fixed at 1D/5m.\n"
         "Source tags: LIVE = stream · DLY = polled/unofficial (yfinance) · STALE = older than 5 min\n"
         "Aliases: ~/.freeterm/aliases.toml   Settings: ~/.freeterm/config.toml")
 
@@ -369,7 +390,8 @@ class Pane(Vertical):
     def focus_view(self) -> None:
         if self.view:
             tables = self.view.query(DataTable)
-            (tables.first() if tables else self.view).focus()
+            scrolls = self.view.query(VerticalScroll)
+            (tables.first() if tables else scrolls.first() if scrolls else self.view).focus()
 
 
 # ---------------------------------------------------------------- app
@@ -480,6 +502,21 @@ class FreeTerm(App):
         for p in self.panes:
             p.set_class(p is pane, "active")
 
+    def active_graph(self, pane=None):
+        from .charts import ChartView
+        view = (pane or self.active_pane()).view
+        if isinstance(view, ChartView):
+            return view if view.graph_commands_enabled else None
+        graphs = [graph for graph in view.query(ChartView) if graph.graph_commands_enabled] if view is not None else []
+        return next((graph for graph in graphs if graph.has_focus_within), graphs[0] if graphs else None)
+
+    def active_command_target(self, pane=None):
+        graph = self.active_graph(pane)
+        if graph is not None:
+            return graph
+        view = (pane or self.active_pane()).view
+        return view if getattr(view, 'view_commands_enabled', False) else None
+
     async def set_layout(self, n: int) -> None:
         box = self.query_one("#panes")
         box.set_classes({1: "", 2: "l2", 4: "l4"}[n])
@@ -503,6 +540,10 @@ class FreeTerm(App):
 
     def action_pane(self, d: int) -> None:
         if isinstance(self.screen, ModalScreen):
+            complete = getattr(self.screen, "complete_command", None)
+            if d > 0 and complete is not None:
+                complete()
+                return
             self.screen.focus_next() if d > 0 else self.screen.focus_previous()
             return
         cmd = self.query_one("#cmd", Input)
@@ -539,26 +580,89 @@ class FreeTerm(App):
         await self._open(self.active_pane(), line)
 
     async def _open(self, pane: Pane, line: str, push: bool = True) -> None:
+        # Only a dot at the start of a word introduces a view command: BRK.B and 0.5y stay intact.
+        line = line.strip().lstrip(":")
+        if re.match(r"/(?:\?|FRED\?)", line, re.I):
+            await self._navigate(pane, line, push)
+            return
+        match = re.search(r"(?<!\S)\.(?=[A-Za-z?])", line)
+        if match is None:
+            await self._navigate(pane, line, push)
+            return
+        navigation, commands = line[:match.start()].strip().lstrip(":"), line[match.start():]
+        history_size = len(pane.history)
+        if navigation and not await self._navigate(pane, navigation, push):
+            return
+        if navigation and push and len(pane.history) > history_size:
+            pane.history[-1] = line.strip().upper()
+        graph = self.active_command_target(pane)
+        if graph is None:
+            self.hub.warn("This view has no .commands; open a graph or /OMON first")
+            return
+        try:
+            graph.execute_graph_command(commands)
+        except (ValueError, OverflowError) as error:
+            self.hub.warn(str(error))
+
+    async def _navigate(self, pane: Pane, line: str, push: bool = True) -> bool:
         try:
             func, sec, args = parse(line, self.aliases)
         except ValueError as e:
             if str(e):
                 self.hub.warn(str(e))
-            return
+            return False
         if func == "LAYOUT":
             await self.set_layout(int(args[0]) if args and args[0] in "124" else 1)
-            return
+            return True
+        if func == "DES":
+            fred_arg = next((arg.split('=', 1)[1] for arg in args if arg.startswith('_FRED=')), None)
+            fred_context = pane.view is not None and (getattr(pane.view, 'mode', None) == 'series' or pane.view.FUNC == 'FRED DES')
+            explicit = fred_arg or (sec[5:] if sec and sec.startswith('FRED:') else None) or next((arg[5:] for arg in args if arg.startswith('FRED:')), None)
+            if explicit or '_T=FRED' in args or (fred_context and sec is None):
+                args = [arg for arg in args if not arg.startswith(('_FRED=', '_T='))]
+                sid = explicit or sec or (args.pop(0) if args else (getattr(pane.view, 'series', []) or [pane.view.sec])[0])
+                func, sec, args = 'FREDDES', sid, []
+        if func in ("IND", "CMP", "MODE", "TIME", "SIZE", "TF"):
+            graph = self.active_command_target(pane)
+            if graph is None:
+                self.hub.warn("Open a security graph before using graph commands")
+                return False
+            if sec is not None and sec != graph.sec:
+                self.hub.warn(f"Graph commands apply to the active graph ({graph.sec}); open {sec} first")
+                return False
+            try:
+                command = re.search(r"(?<!\S)/" + func + r"(?:\s|$)", line, re.I)
+                graph.execute_graph_command(line[command.start():] if command else "/" + func + " " + " ".join(args))
+            except (ValueError, OverflowError) as error:
+                self.hub.warn(str(error))
+                return False
+            return True
         if func in SEC_FUNCS and not sec:
-            sec = args.pop(0) if args else (pane.view.sec if pane.view else None)
+            range_only = func == "DAT" and args and (is_range(args[0]) or is_interval(args[0]))
+            sec = args.pop(0) if args and not range_only else (pane.view.sec if pane.view else None)
             sec = self.aliases.get(sec, sec) if sec else None
             if not sec:
                 self.hub.warn(f"/{func} needs a security, e.g. /{func} AAPL")
-                return
+                return False
+        if func == "DAT" and pane.view is not None and hasattr(pane.view, "rng"):
+            selected = next((arg for arg in args if is_range(arg)), None)
+            if selected is None:
+                args.append(pane.view.rng)
+            if not any(is_interval(arg) for arg in args if not is_range(arg)) and selected in (None, pane.view.rng) and hasattr(pane.view, "iv"):
+                args.append(pane.view.iv)
         cls = VIEWS.get(func)
+        if func == 'COMP':
+            from .comparison import parse as parse_comparison
+            try:
+                refs, selected_mode = parse_comparison(([sec] if sec else []) + args, self.aliases)
+            except ValueError as error:
+                self.hub.warn(str(error)); return False
+            args, sec = refs + ['_mode=' + selected_mode] + [a for a in args if is_range(a)], None
         if cls is None:
             cls = type(f"Stub{func}", (StubView,), {"FUNC": func})
         await pane.show(cls(self.hub, sec, args), line.strip().upper(), push)
         self.update_hints()
+        return True
 
     # -- command line
     @on(Input.Submitted, "#cmd")
@@ -589,6 +693,12 @@ class FreeTerm(App):
             return
         if isinstance(self.screen, ModalScreen):
             return
+        if e.character == ".":
+            graph = self.active_command_target()
+            if graph is not None:
+                graph.open_graph_commands()
+                e.stop()
+                return
         if e.character and (e.character.isupper() or e.character in ":/"):
             cmd.focus()
             cmd.value = "" if e.character == ":" else e.character
@@ -596,17 +706,23 @@ class FreeTerm(App):
             e.stop()
 
     def complete(self, cmd: Input) -> None:
-        words = cmd.value.upper().split(" ")
+        raw_words = cmd.value.split(' ')
+        words = [word.upper() for word in raw_words]
+        raw_stem = ' '.join(raw_words[:-1])
         last = words[-1]
-        if (self.tab_state and self.tab_state[0] == " ".join(words[:-1])
+        if (self.tab_state and self.tab_state[0] == raw_stem
                 and last == self.tab_state[1][self.tab_state[2]]):
             stem, opts, i = self.tab_state
             i = (i + 1) % len(opts)
         else:
-            pool = sorted({"/" + f for f in FUNCS} if last.startswith("/")
-                          else set(self.aliases) | set(load_watchlist()))
+            from .graph_commands import VERBS, available_verbs
+            graph = self.active_command_target()
+            verbs = available_verbs(graph) if graph is not None else VERBS
+            pool = sorted({"." + verb for verb in (*verbs, "HELP")} if last.startswith(".") else
+                          {"/" + f for f in FUNCS} if last.startswith("/") else
+                          set(self.aliases) | set(load_watchlist()))
             opts = [w for w in pool if w.startswith(last)] or [last]
-            stem, i = " ".join(words[:-1]), 0
+            stem, i = raw_stem, 0
         self.tab_state = (stem, opts, i)
         cmd.value = (stem + " " if stem else "") + opts[i]
         cmd.cursor_position = len(cmd.value)
@@ -647,4 +763,4 @@ def main() -> None:
 
 def register() -> None:
     """Import feature modules; each adds its views to VIEWS."""
-    from . import boards, charts, depth, fundamentals  # noqa: F401
+    from . import boards, charts, depth, fundamentals, securities, fred_search, fred_des  # noqa: F401
