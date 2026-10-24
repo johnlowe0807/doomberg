@@ -345,7 +345,7 @@ def help_text() -> str:
         "Graph commands: '.' popup · .IND VOLUME VWAP RSI MACD · .IND RSI MACD _p=14;12,26,9 · .CMP AAPL AMZN · .IEX ON\n"
         "                .TIME 2Y [1d] · .SIZE 2d or 0.5y · .TF 20240101 3M · .SIZE RESET\n"
         "Graph HELP lists commands for its type. HOME preview is fixed at 1D/5m.\n"
-        "Source tags: LIVE = stream · DLY = polled/unofficial (yfinance) · STALE = older than 5 min\n"
+        "Source tags: LIVE = stream · DLY = polled/unofficial (yfinance) · STALE = expired fallback / older than 5 min\n"
         "Aliases: ~/.freeterm/aliases.toml   Settings: ~/.freeterm/config.toml")
 
 
@@ -428,6 +428,7 @@ class FreeTerm(App):
         yield Static("", id="status")
 
     async def on_mount(self) -> None:
+        await self.hub.initialize()
         await self.set_layout(int(self.cfg.get("general", "layout", 1)))
         self.set_interval(1, self.tick)
         self.run_worker(self.start_streams(), group="streams")
@@ -448,6 +449,9 @@ class FreeTerm(App):
             self.cfg.set("general", "command_syntax", "slash")
         await self.run_command_async(start)
         self.tick()
+
+    async def on_unmount(self) -> None:
+        await self.hub.close()
 
     def stream_wants(self) -> list[str]:
         """Symbols worth streaming, most important first: recently viewed, then watchlist, then crypto board."""
@@ -558,7 +562,7 @@ class FreeTerm(App):
         ps[i].focus_view()
 
     def action_force_refresh(self) -> None:
-        self.hub.mem = type(self.hub.mem)()
+        self.hub.force_refresh()
         for p in self.panes:
             if p.view:
                 p.view.reload()

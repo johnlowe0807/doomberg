@@ -16,10 +16,10 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
   Types: EQUITY, FUTURE, CRYPTOCURRENCY (or CRYPTO), CURRENCY (or FX), ETF, INDEX, MUTUALFUND, OPTION (or OPTIONS).
   Filter every search column with `_s=symbol`, `_n=name`, `_t=type`, `_p=source` (local/alias/Yahoo/EDGAR).
   `/??` lists values and examples. Filters ignore case; use commas for alternatives and quotes for multiword values.
-  Local matches appear immediately; Yahoo and SEC add results. Enter opens the selected symbol.
+  Stored index matches appear first; Yahoo and SEC discovery refresh the index. Enter opens the selected symbol.
 - `/FRED? inflation _f=M _a=SA` searches public FRED pages without an API key. `/FRED??` lists series ID,
   title, frequency, units, adjustment and date filters. Enter charts the series. Searches inspect up to four result
-  pages and display at most 100 matches; filter-only searches browse a small local catalog.
+  pages and display at most 100 matches; filters also apply to previously indexed series.
 - FRED descriptions: `/FRED DGS10 /DES`, `/DES` from a FRED graph, `/DES FRED:DGS10`, or
   `/DES _fred=DGS10` shows source/release, units, frequency, updates, observed history and explanatory notes.
   Press `g` to return to the graph; PageDown moves focus to the notes.
@@ -101,8 +101,29 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
 - Quit: Ctrl+Q opens a keyboard confirmation popup. Press Ctrl+Q again to quit, or `n`/`N` or Escape to cancel.
 
 ## Status
-All functions in the brief are built and smoke-tested against live data. The Alpaca IEX path is the exception: it's untested because no keys were available.
+All functions in the brief are built and smoke-tested against live data, with optional Alpaca authentication/streaming also checked. IEX edge cases and physical-terminal graphics QA remain in the handoff.
 The TODO list is in `HANDOFF.md` under **Open items**.
 
 ## Test
 `FREETERM_HOME=/tmp/ftsmoke .venv/bin/python -W ignore tests/smoke.py`
+
+## Data pipeline
+
+Views use typed queries through `DataHub`; provider code and parsers live outside Textual.
+`~/.freeterm/data/observations.sqlite3` stores OHLCV/FRED observations, structured XBRL facts,
+filing indexes, news and an FTS5 search index in separate tables, with source, observation/fetch
+timestamps and content versions. Rolling history refreshes retain captured observations.
+News remains raw headlines/summaries and readable article text; no sentiment analysis runs.
+
+Disposable provider responses and derived results live separately in `cache/pipeline.sqlite3`.
+Provider policies retain rate limiting/backoff. Analysis keys include parameters, input versions
+and calculation versions; chart windows, indicators, comparisons and DAT reuse these results.
+Ctrl+R refreshes stored inputs and bypasses older dependent results; OMON REFRESH targets its
+expiry/chain. Failed fetches expose STALE fallback metadata and status warnings.
+
+Cleanup runs at startup and at most every ten minutes: 1,500 datasets / 256 MiB of compressed
+content, two million OHLCV rows total, 100,000 observations per series, two years without access,
+90 days of news and 50,000 search records (one year). Provider and analysis caches each have a
+64 MiB budget (1,000/512 entries); expired responses and 30-day analysis results are removed.
+SQLite overhead/WAL files can temporarily exceed these logical budgets. Settings/watchlists
+are preserved; legacy JSON caches are left untouched and are no longer read.

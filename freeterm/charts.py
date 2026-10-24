@@ -14,7 +14,7 @@ from textual_plotext import PlotextPlot
 
 from .app import DIM, UP, DOWN, WARN, VIEWS, View, fbig, fnum, colored, tag_text
 from .app import regular_hours
-from .data import IVS, RANGES, DiskCache, RateLimiter, is_range, range_days, range_span_days, slice_range, candle_interval, step_interval
+from .data import IVS, RANGES, is_range, range_days, range_span_days, slice_range, candle_interval, step_interval
 from .live import age, iex_eval
 from .pixelcharts import ChartSurface, GraphicsFailed, PixelSizeChanged, Panel, Scene, Trace, color_dual_axes, render_stacked_text
 from .options import contract, name as option_name
@@ -36,57 +36,13 @@ def default_interval(rng):
 
 
 # ---------------------------------------------------------------- indicators
-def ints(s: str) -> list[float]:
-    return [float(x) for x in str(s).replace(" ", "").split(",") if x]
-
-
-def sma(c, n): return c.rolling(int(n)).mean()
-def ema(c, n): return c.ewm(span=int(n), adjust=False).mean()
-
-
-def rsi(c, n=14):
-    d = c.diff()
-    up = d.clip(lower=0).ewm(alpha=1 / n, adjust=False).mean()
-    dn = (-d.clip(upper=0)).ewm(alpha=1 / n, adjust=False).mean()
-    return 100 - 100 / (1 + up / dn.replace(0, np.nan))
-
-
-def macd(c, f=12, s=26, sig=9):
-    m = ema(c, f) - ema(c, s)
-    return m, ema(m, sig)
-
-
-def vwap(df):
-    tp = (df.High + df.Low + df.Close) / 3
-    day = df.index.date if hasattr(df.index, "date") else 0
-    pv = (tp * df.Volume).groupby(day).cumsum()
-    v = df.Volume.groupby(day).cumsum().replace(0, np.nan)
-    return pv / v
+from .analytics import ints, sma, ema, rsi, macd, vwap
 
 
 # ---------------------------------------------------------------- FRED
 async def fred(hub, sid: str) -> pd.Series | None:
-    """FRED series via keyless CSV; disk-cached 6h. Returns float Series indexed by date."""
-    disk = DiskCache("fred")
-    raw = disk.get(sid, 6 * 3600)
-    if raw is None:
-        import httpx
-        lim = hub.limiters.setdefault("fred", RateLimiter("fred", 2, 2))
-        try:
-            async with lim:
-                async with httpx.AsyncClient(timeout=20, follow_redirects=True) as c:
-                    r = await c.get(f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={sid}")
-                    r.raise_for_status()
-            raw = r.text
-            disk.put(sid, raw)
-        except Exception as e:
-            hub.warn(f"FRED {sid}: {type(e).__name__}")
-            raw = disk.get(sid)  # stale fallback
-            if raw is None:
-                return None
-    df = pd.read_csv(io.StringIO(raw), na_values=".")
-    s = pd.Series(pd.to_numeric(df.iloc[:, 1], errors="coerce").values, index=pd.to_datetime(df.iloc[:, 0]), name=sid)
-    return s.dropna()
+    from .query_models import SeriesQuery
+    return hub.value(await hub.query(SeriesQuery(sid)))
 
 
 # ---------------------------------------------------------------- chart view
@@ -210,33 +166,17 @@ class ChartView(View):
             df = pd.concat(ss, axis=1).ffill()
             self.df = slice_range(df, self.rng)
         elif self.mode == "comp":
-            cols = {}
-            missing = []
-            for ref in self.compare_refs:
-                values = await comparison.fetch(self.hub, ref, self.rng, self.iv)
-                if values is not None and len(values):
-                    cols[ref] = values
-                else:
-                    missing.append(ref)
-            self.comparison_missing = missing
-            if missing:
-                self.hub.warn('Comparison unavailable: ' + ', '.join(missing))
-            if not cols:
-                self.df = None
-                return self.info('N/A — no comparison data')
-            df = comparison.align(cols, self.rng, self.iv)
-            empty = df.columns[df.isna().all()].tolist()
-            if empty:
-                self.comparison_missing = list(dict.fromkeys(missing + empty))
-                self.hub.warn('No observations in comparison window: ' + ', '.join(empty))
-                df = df.drop(columns=empty)
+            from .query_models import ComparisonQuery
             try:
-                if df.empty:
-                    raise ValueError('No observations in the selected comparison window')
-                if self.compare_mode == 'STACKED' and len(df.columns) != len(self.compare_refs):
-                    raise ValueError('STACKED needs data for every selected series')
-                self.raw_comparison = df
-                self.df = comparison.normalized(df) if self.compare_mode == 'NORMALIZED' else df.copy()
+                result = await self.hub.query(ComparisonQuery(tuple(self.compare_refs), self.rng, self.iv, self.compare_mode))
+                data = result.data
+                if data is None:
+                    self.df = None
+                    return self.info(result.meta.reason or 'N/A — no comparison data')
+                self.comparison_missing = data['missing']
+                if self.comparison_missing:
+                    self.hub.warn('Comparison unavailable: ' + ', '.join(self.comparison_missing))
+                self.raw_comparison, self.df = data['raw'], data['values']
             except ValueError as error:
                 self.df = None
                 return self.info(str(error))
@@ -329,10 +269,32 @@ class ChartView(View):
         return self.df.iloc[lo:hi]
 
     def draw(self) -> None:
+        if self.df is None or self.df.empty:
+            return
+        if self.mode == 'px' and self.ind:
+            signature = (id(self.df), tuple(sorted(self.ind)), tuple(sorted(self.parameters.items())),
+                         tuple(str(v) for v in self.df.iloc[-1]))
+            if signature != getattr(self, '_indicator_signature', None):
+                self.run_worker(self._prepare_indicators(signature), exclusive=True, group='indicators')
+                return
         try:
             self._draw_scene()
-        except Exception as e:  # fail soft: a bad chart must never take the app down
-            self.hub.warn(f"{self.title}: chart error {type(e).__name__}: {e}"[:120])
+        except Exception as error:
+            self.hub.warn(f'{self.title}: chart error {type(error).__name__}: {error}'[:120])
+
+    async def _prepare_indicators(self, signature):
+        from .analytics import indicators
+        frame, active, parameters = self.df.copy(), set(self.ind), dict(self.parameters)
+        try:
+            result = await self.hub.derive('indicators', {'active': sorted(active), 'parameters': parameters}, [frame],
+                                           lambda: indicators(frame, active, parameters), 'technical-indicators-v1')
+            current = (id(self.df), tuple(sorted(self.ind)), tuple(sorted(self.parameters.items())),
+                       tuple(str(v) for v in self.df.iloc[-1])) if self.df is not None and len(self.df) else None
+            if self.is_mounted and self.mode == 'px' and current == signature:
+                self._indicators, self._indicator_signature = result, signature
+                self.draw()
+        except Exception as error:
+            self.hub.warn(f'{self.title}: indicators {type(error).__name__}: {error}'[:120])
 
     def _draw_scene(self) -> None:
         if self.df is None or not len(self.df):
@@ -357,17 +319,8 @@ class ChartView(View):
                 candles = raw[["Open", "High", "Low", "Close"]].to_numpy(dtype=float, copy=True)
             else:
                 main.traces.append(Trace("Close", raw.Close.to_numpy(dtype=float, copy=True), RGB_FG))
-            overlays = []
-            if "s" in self.ind:
-                overlays += [(f"SMA{int(p)}", sma(full.Close, p)) for p in ints(self.parameters["sma"])]
-            if "e" in self.ind:
-                overlays += [(f"EMA{int(p)}", ema(full.Close, p)) for p in ints(self.parameters["ema"])]
-            if "b" in self.ind:
-                period, k = (ints(self.parameters["bb"]) + [20, 2])[:2]
-                mid, sd = sma(full.Close, period), full.Close.rolling(int(period)).std()
-                overlays += [("BB+", mid + k * sd), ("BBm", mid), ("BB-", mid - k * sd)]
-            if "w" in self.ind and "Volume" in full:
-                overlays.append(("VWAP", vwap(full)))
+            features = getattr(self, '_indicators', {}) if self.ind else {}
+            overlays = features.get('overlays', [])
             main.traces += [Trace(label, win(series), PALETTE[(j + 1) % len(PALETTE)])
                             for j, (label, series) in enumerate(overlays)]
             ev = None if self.rng.startswith("TF:") else iex_eval(self.hub, self.sec, regular_hours())
@@ -380,11 +333,10 @@ class ChartView(View):
                                     bar_colors=[RGB_UP if c >= o else RGB_DN for c, o in zip(raw.Close, raw.Open)],
                                     limits=(0, max(1., float(raw.Volume.max())))))
             if "r" in self.ind:
-                panels.append(Panel("RSI", [Trace("RSI", win(rsi(full.Close, ints(self.parameters["rsi"])[0])), RGB_Y)],
+                panels.append(Panel("RSI", [Trace("RSI", win(features['rsi']), RGB_Y)],
                                     limits=(0, 100), guides=[(30, "#00FF87"), (70, "#FF4D6D")]))
             if "m" in self.ind:
-                fast, slow, signal = (ints(self.parameters["macd"]) + [12, 26, 9])[:3]
-                m, sg = macd(full.Close, fast, slow, signal)
+                m, sg = features['macd']
                 hist = win(m - sg)
                 panels.append(Panel("MACD", [Trace("MACD", win(m), RGB_FG), Trace("Signal", win(sg), RGB_Y)],
                                     bars=hist, bar_colors=[RGB_UP if v >= 0 else RGB_DN for v in hist],

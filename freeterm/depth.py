@@ -59,8 +59,7 @@ class DesView(View):
         yield Static("", classes="msg", id="summary")
 
     async def load(self) -> None:
-        import yfinance as yf
-        info = await self.hub.yf_call(f"info:{self.sec}", 3600, lambda: yf.Ticker(self.sec).info)
+        info = await self.hub.resource("yf", "profile", symbol=self.sec)
         if not info:
             self.query_one("#summary", Static).update(Text(f"N/A — no profile for {self.sec}", style=WARN))
             return
@@ -123,39 +122,12 @@ class HpView(View):
 
 
 # ---------------------------------------------------------------- news
-def norm_yf_news(items) -> list[dict]:
-    """yfinance has shipped two news shapes: flat dicts and {'content': {...}}. Handle both."""
-    out = []
-    for it in items or []:
-        c = it.get("content") or it
-        url = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
-               or c.get("link") or "")
-        t = c.get("pubDate") or c.get("displayTime") or c.get("providerPublishTime")
-        try:
-            ts = datetime.fromtimestamp(t, timezone.utc) if isinstance(t, (int, float)) else pd.Timestamp(t).to_pydatetime()
-        except Exception:
-            ts = None
-        src = (c.get("provider") or {}).get("displayName") or c.get("publisher") or "Yahoo"
-        if c.get("title"):
-            out.append({"title": c["title"], "src": src, "ts": ts, "url": url,
-                        "summary": c.get("summary") or c.get("description") or ""})
-    return out
+from .normalization import norm_yf_news
 
 
 async def rss(hub, url: str) -> list[dict]:
-    import feedparser
-    raw = await hub.http("rss", url, 2, {"User-Agent": "Mozilla/5.0 freeterm"}, ttl=300, as_json=False, retries=0)
-    if not raw:
-        return []
-    f = await asyncio.to_thread(feedparser.parse, raw)
-    name = (f.feed.get("title") or url.split("/")[2])[:18]
-    out = []
-    for e in f.entries:
-        tp = e.get("published_parsed") or e.get("updated_parsed")
-        ts = datetime.fromtimestamp(time.mktime(tp), timezone.utc) if tp else None
-        out.append({"title": e.get("title", ""), "src": name, "ts": ts, "url": e.get("link", ""),
-                    "summary": e.get("summary", "")})
-    return out
+    from .query_models import NewsQuery
+    return hub.value(await hub.query(NewsQuery(feeds=(url,)))) or []
 
 
 class NewsView(View):
@@ -167,8 +139,9 @@ class NewsView(View):
         yield DataTable(cursor_type="row")
 
     async def fetch(self) -> list[dict]:
-        lists = await asyncio.gather(*(rss(self.hub, u) for u in self.app.cfg.get("news", "feeds", [])))
-        return [x for l in lists for x in l]
+        from .query_models import NewsQuery
+        result = await self.hub.query(NewsQuery(feeds=tuple(self.app.cfg.get("news", "feeds", []))))
+        return result.data or []
 
     async def load(self) -> None:
         items = await self.fetch()
@@ -200,10 +173,10 @@ class CnView(NewsView):
     refresh_secs = 300
 
     async def fetch(self) -> list[dict]:
-        import yfinance as yf
-        yfn = await self.hub.yf_call(f"news:{self.sec}", 300, lambda: yf.Ticker(self.sec).news)
-        feed = await rss(self.hub, f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={self.sec}&region=US&lang=en-US")
-        return norm_yf_news(yfn) + feed
+        from .query_models import NewsQuery
+        feed = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={self.sec}&region=US&lang=en-US"
+        result = await self.hub.query(NewsQuery(symbol=self.sec, feeds=(feed,)))
+        return result.data or []
 
 
 # ---------------------------------------------------------------- OMON
@@ -260,13 +233,12 @@ class OmonView(View):
         super().on_mount()
 
     async def load(self) -> None:
-        import yfinance as yf
         sym = self.sec
         self.contracts = []
         self.strikes = []
         self.loaded_expiry = None
         self.query_one("#chain", DataTable).clear(columns=True)
-        exps = await self.hub.yf_call(f"exps:{sym}", 300, lambda: yf.Ticker(sym).options)
+        exps = await self.hub.resource("yf", "expiries", symbol=sym)
         if not exps:
             self.expiries = []
             self.query_one("#hdr", Static).update(Text(f"N/A — no listed options for {sym}", style=WARN))
@@ -289,7 +261,7 @@ class OmonView(View):
         self.exp_i = max(0, min(self.exp_i, len(exps) - 1))
         exp = exps[self.exp_i]
         self.current_expiry = exp
-        ch = await self.hub.yf_call(f"chain:{sym}:{exp}", 30, lambda: yf.Ticker(sym).option_chain(exp))
+        ch = await self.hub.resource("yf", "chain", symbol=sym, expiry=exp)
         if ch is None or all(frame is None or frame.empty for frame in (ch.calls, ch.puts)):
             self.chain_header = f'{sym} expiry {exp} — N/A: Yahoo returned no quoted contracts; EXP NEXT / REFRESH'
             self.render_header()
@@ -323,7 +295,7 @@ class OmonView(View):
                     o = df.loc[k]
                     o = o.iloc[0] if isinstance(o, pd.DataFrame) else o
                     contracts[side] = o.get("contractSymbol")
-                    remember_quote(self.hub, o)
+                    remember_quote(self.hub, o, getattr(ch, "freeterm", None))
                     iv = number(o.get("impliedVolatility")) or 0
                     g = bs_greeks(S, k, T, r, iv, is_call) if S and iv > 0.001 else None
                     itm = bool(o.get("inTheMoney"))

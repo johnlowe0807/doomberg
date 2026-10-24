@@ -12,30 +12,7 @@ from textual.binding import Binding
 from .app import VIEWS, View
 
 
-def parse_description(html):
-    soup = BeautifulSoup(html, 'lxml')
-    def text(selector):
-        node = soup.select_one(selector)
-        return node.get_text(' ', strip=True) if node else ''
-    fields = {'Title': text('h1'), 'Units': text('.series-meta-value-units'),
-              'Frequency': text('.series-meta-value-frequency'),
-              'Updated': ' '.join(filter(None, (text('.series-meta-updated-date'), text('.series-meta-updated-time')))),
-              'Source': text('.series-source'), 'Release': text('.series-release')}
-    notes = soup.select_one('#notes-content')
-    description = []
-    if notes:
-        for paragraph in notes.find_all('p', recursive=False):
-            if paragraph.find('strong') or paragraph.find_parent(class_='series-citation'):
-                continue
-            value = paragraph.get_text(' ', strip=True)
-            if value:
-                description.append(value)
-        units = next((p for p in notes.select('p') if p.find('strong') and
-                      p.find('strong').get_text(strip=True) == 'Units:'), None)
-        if units:
-            value = units.get_text(' ', strip=True).removeprefix('Units:').strip()
-            fields['Adjustment'] = value.split(',', 1)[-1].strip() if ',' in value else ''
-    return fields, '\n\n'.join(description)
+from .normalization import parse_description
 
 
 async def description(hub, sid):

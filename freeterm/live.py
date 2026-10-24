@@ -71,9 +71,9 @@ async def coinbase_stream(hub, want) -> None:
                     if m.get("type") == "ticker":
                         f = lambda k: float(m[k]) if m.get(k) not in (None, "") else None
                         s = m["product_id"]
-                        hub.last[s] = Quote(s, price=f("price"), prev_close=f("open_24h"), volume=f("volume_24h"),
+                        await hub.publish_quote(Quote(s, price=f("price"), prev_close=f("open_24h"), volume=f("volume_24h"),
                                             day_low=f("low_24h"), day_high=f("high_24h"), ts=iso_ts(m.get("time")),
-                                            fetched=time.time(), source="coinbase", live=True)
+                                            fetched=time.time(), source="coinbase", live=True))
                     elif m.get("type") == "error":
                         hub.warn(f"coinbase: {m.get('message')} {m.get('reason', '')}"[:100])
                     if time.time() - t_check > 30:        # resubscribe if the wanted set grew
@@ -171,7 +171,7 @@ async def alpaca_stream(hub, want) -> None:
                         if m.get("T") == "t":
                             record = iex_trade(m, "ws")
                             if record:
-                                hub.iex[m["S"]] = record
+                                await hub.publish_iex(m["S"], record)
                         elif m.get("T") == "subscription":
                             hub.streams["iex"] = f"LIVE {len(m.get('trades', []))}"
                         elif m.get("T") == "error":
@@ -204,7 +204,7 @@ async def alpaca_poll(hub, want) -> None:
                     for s, tr in ((d or {}).get("trades") or {}).items():
                         record = iex_trade(tr, "rest")
                         if record and record["ts"] >= hub.iex.get(s, {}).get("ts", 0):
-                            hub.iex[s] = record
+                            await hub.publish_iex(s, record)
         except asyncio.CancelledError:
             raise
         except Exception as e:

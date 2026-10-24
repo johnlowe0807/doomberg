@@ -73,7 +73,8 @@ class DatView(View):
         if frame is None or frame.empty:
             header.update(f"N/A — no {self.iv} history for {self.sec} over {self.rng}")
             return
-        for label, value in statistics(frame, self.iv):
+        rows = await self.hub.derive("statistics", {"interval": self.iv}, [frame], lambda: statistics(frame, self.iv), "statistics-v1")
+        for label, value in rows:
             table.add_row(label, value)
         header.update(f"{self.sec} · {self.rng} / {self.iv} · {frame.index[0]:%Y-%m-%d %H:%M} to "
                       f"{frame.index[-1]:%Y-%m-%d %H:%M} · Yahoo DLY · volume in provider units")
@@ -114,8 +115,7 @@ async def order_book(hub, symbol):
         row = await snapshot(hub, symbol)
         info = {} if row is None else row
     else:
-        import yfinance as yf
-        info = await hub.yf_call(f"book:{symbol}", 15, lambda: yf.Ticker(symbol).info) or {}
+        info = await hub.resource("yf", "book", symbol=symbol) or {}
     def top(side):
         price = number(info.get(side))
         return [(price, number(info.get(side + "Size")))] if price is not None and price > 0 else []

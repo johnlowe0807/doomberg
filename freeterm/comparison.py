@@ -81,9 +81,8 @@ async def fetch(hub, ref, rng, interval):
         from .charts import fred
         return await fred(hub, ref[5:])
     if ref.startswith('ERN:'):
-        import yfinance as yf
         symbol = ref[4:]
-        frame = await hub.yf_call(f'ed:{symbol}', 3600, lambda: yf.Ticker(symbol).get_earnings_dates(limit=28))
+        frame = await hub.resource('yf', 'earnings', symbol=symbol)
         if frame is None or 'Surprise(%)' not in frame:
             return None
         values = pd.to_numeric(frame['Surprise(%)'], errors='coerce').dropna().sort_index()

@@ -7,7 +7,14 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 | File | Contents |
 |---|---|
 | `config.py` | `Config` (`get/set(section,key)`, auto-saves `~/.freeterm/config.toml`), aliases (`aliases.toml`), watchlist (`watchlist.json`) |
-| `data.py` | `TTLCache`, `DiskCache(ns)`, `RateLimiter` (429 backoff, status text), `Quote` (`.tag` LIVE/DLY/STALE), `Provider` interface, `YFProvider`, `DataHub` (the only thing views call: `quotes`, `history`, `yf_call`, `http`, `validate_alpaca`, `live_fresh`, `status`) |
+| `data.py` | `DataHub` view adapter, typed query access, live snapshots, chart interval/window math; compatibility `quotes/history/bars/resource/http` methods delegate to queries |
+| `query_models.py` | Typed requests/results, provenance/freshness metadata and Quote model (re-exported by data.py) |
+| `ingestion.py` | Provider adapters, Yahoo named operations, HTTP, rate limiting, cancellation-safe pacing and 429 backoff |
+| `normalization.py` | Pure provider parsers: OHLC-related snapshots, FRED, news, descriptions, discovery and document extraction |
+| `storage.py` | Versioned SQLite domain repositories and separate disposable response/analysis caches |
+| `query.py` | Async typed query/feature services, freshness policies, shared ingestion, explicit fallback and versioned worker analysis |
+| `analytics.py` | Pure existing technical indicator calculations, consumed by worker analysis |
+| `discovery.py`, `fred_discovery.py`, `catalog.py` | Bounded discovery ingestion, indexed selection, FRED query syntax and offline seeds |
 | `app.py` | `FreeTerm` app, command parser, `Pane` (per-pane Esc history), `View` base, `MonView`, `HelpView`/`HelpScreen` (`?`), `PromptScreen`, NYSE holidays, stream startup |
 | `dialogs.py` | Shared buttonless `ConfirmScreen` styling and cancel keys, plus `QuitConfirm`. Browser confirmation subclasses the same dialog. |
 | `charts.py` | `ChartView` (GP) + `GIPView`, `CompView`, `FredView`, `SprdView`, `QuoteChartView` (bare security). Indicators (SMA/EMA/BB/VWAP/RSI/MACD), FRED CSV fetch, IEX banner and overlay |
@@ -21,7 +28,7 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 | `fred_search.py` | Keyless `/FRED?` public-page discovery, bounded pagination, column filters, offline catalog and `/FRED??` help |
 | `options.py` | Option contract parsing, bounded expiry/chain discovery, descriptive names, cached contract quotes and OPTION-only search |
 | `securities.py` | DAT selected-range statistics and BOOK bid/ask snapshots (Yahoo top of book, Coinbase aggregated depth) |
-| `news.py` | News article extraction, `ArticleReader` (reuses filing pager controls), `BrowserConfirm` (keyboard-only: Y opens; N/Esc/Enter cancels). HTTP via DataHub; extraction in a worker thread; article text cached for 1 hour. |
+| `news.py` | `ArticleReader` (filing pager controls) and keyboard-only `BrowserConfirm`; typed TextQuery supplies readable text from versioned worker extraction |
 | `fundamentals.py` | EDGAR ticker→CIK, companyfacts → FA (XBRL `frame`-based), submissions (incl. old pages) → FIL, `Pager` (full-screen reader), ERN (+8-K 2.02 → EX-99.1), EVTS |
 | `live.py` | Coinbase ticker websocket, Alpaca IEX websocket and REST polling, `iex_eval` (overlay math) |
 | `theme.tcss` | the palette (single source of truth) |
@@ -65,10 +72,10 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 - The command Input uses `select_on_focus=False`. Otherwise the first typed letter, inserted when focus jumps, gets replaced.
 - Ctrl+Q opens `QuitConfirm`, using the same popup as browser confirmation. Ctrl+Q again confirms; N/n or Escape cancels. Y and Enter do not quit. There is no timer. Cancel restores the previous screen and focus. Ctrl+C shows quit instructions.
 - **Chart bars are derived, not fetched per view** (user asked to avoid rate limits when flipping). `DataHub.bars(sym, rng, iv)`
-  picks a base download from `data.BASES` (1m/7d, 5m/60d, 1h/730d, 1d/max), caches it, then resamples and slices
-  locally. `ChartView` calls `hub.prefetch_bars()` after first paint, so a chart costs 4 requests and every later
-  range/interval flip costs 0 (`tests/ranges.py` asserts this). Concurrent requests for the same base share one download
-  (`_inflight`). Availability comes from `base_for()`; there is no separate interval-limit table anymore.
+  picks a base download from `data.BASES` (1m/7d, 5m/60d, 1h/730d, 1d/max), persists observations, then derives windows
+  in workers with versioned result caching. `ChartView` calls `hub.prefetch_bars()` after first paint, so a chart costs 4 requests and every later
+  range/interval flip costs 0 while stored inputs remain fresh. Concurrent requests for the same dataset share one task
+  in QueryService. Availability comes from `base_for()`; there is no separate interval-limit table anymore.
 - 1D/5D are trading sessions for exchange-hours symbols, and a rolling 24h/5d window for symbols that trade on weekends (crypto).
 - Month/year price ranges use calendar offsets (including leap years), rather than approximate day counts.
 - Price chart headers report the return from the first valid close to the last valid close in the full selected range,
@@ -83,6 +90,37 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
   minutes claiming 30–50M. `data.flag_bad_volume` (1m base only) blanks bars above 100× the session median and sets
   `BadVol`. The chart then says "N bad Yahoo volume prints hidden". Don't apply it to 5m (clean) or crypto (false positives).
 
+## Query and storage contracts
+- `QueryService.query()` returns `Result(data, meta, inputs)`. Metadata includes source, observation time, original fetch time,
+  content version, freshness (`fresh/stale/unavailable`), cache origin and fallback reason. DataHub exposes warnings/status;
+  frame adapters retain metadata in `frame.attrs['freeterm']`. Cached results never promote stale inputs to fresh.
+- Typed requests cover quotes, history, price windows, FRED, facts, filings, news, readable documents, indexed search and
+  comparisons. `stored_only=True` suppresses ingestion. `StoredBarsQuery(symbol, interval, start, end)` reads captured
+  observations across history requests with per-row `FetchedAt` and `Source`; date bounds are inclusive/exclusive UTC.
+- `data/observations.sqlite3` uses dedicated OHLCV/FRED, fact, filing, news and FTS5 tables, plus source documents for
+  profiles/options/calendars and original documents. Rolling refreshes merge timestamps and retain earlier observations;
+  corrections replace matching timestamps. Market records retain their original per-row fetch times. SQLite schema v2
+  has versioned initialization and upgrades; no pickle is used. Existing settings, aliases and watchlists retain their paths.
+- `cache/pipeline.sqlite3` is disposable. Provider responses have independent short TTLs; normalized datasets have
+  per-source/type freshness policies in `query.POLICIES` (history bases retain 60/120/300/900s). Response expiry cannot
+  delete observations. A failed fetch returns stored data with STALE metadata and a reason, or explicit unavailable data.
+- `AnalysisQuery` requires parameters, all input content versions and a calculation version. Existing windows/resampling,
+  indicator series, comparisons, DAT and text extraction use worker calculations. Bump calculation versions when logic
+  changes. Live-patched frames include their actual content hash. No sentiment or speculative analytics were added.
+- Ctrl+R advances the ingestion generation and freshness cutoff; older in-flight responses cannot overwrite refreshed data
+  or repopulate its response cache. Derived keys change with inputs/parameters/logic, and results predating the cutoff are
+  bypassed. Scoped OMON refresh invalidates the expiry list and selected/attempted chain, including empty chains.
+- Retention runs on initialization and every ten minutes of queries: 1,500 datasets / 256 MiB compressed payload, 100k
+  observations per series / 2m OHLCV rows total, two-year idle datasets, 90-day news, 50k/one-year search rows. Each cache
+  namespace has a 64 MiB logical budget (provider 1,000 entries, analysis 512); analysis TTL is 30 days. SQLite page/WAL
+  overhead may temporarily exceed budgets; free pages are reclaimed when substantial. Legacy JSON caches are untouched
+  and unused. Storage initialization failures fall back to session-only repositories with warnings; cache errors bypass
+  caching, and successful provider data remains usable if persistence fails.
+- Search always selects from the index. Local/alias seeds, bounded Yahoo/SEC/FRED discovery and enriched names populate
+  it before selection; recorded query associations preserve provider fuzzy matches. Column filters remain AND/OR as
+  before. OPTION discovery stays explicit and bounded to one expiry/100 contracts. News stores publisher/provider and
+  publication/fetch timestamps with raw summaries; readable text extraction runs only when requested.
+
 ## Conventions
 - `App.active_command_target()` routes dot commands and the shared popup to either the active chart or OMON. `active_graph()` still returns only a chart. Options commands use EXP/SIDE/STRIKE/WIDTH/UNDERLYING/OPEN/GRAPH/HIST/BOOK/REFRESH; graph CHAIN returns to the contract’s expiry/side/strike. Navigation/help commands must be last. Deferred expiry selectors resolve after the initial expiry fetch. Empty chains stay navigable and explain their provider result; REFRESH evicts the attempted chain even if it was empty.
 - Comparison references are canonical security symbols, FRED:SERIES or ERN:TICKER. Main /COMP and scoped CMP share parsing of _fred=/_ern=/_mode=. MODE updates cached comparison data; state changes clear stale frames. NORMALIZED uses a common observed baseline (zero baselines fail clearly), REAL retains values, STACKED supports 1–8 independent scales, all shown as numbered, color-matched columns on the left (STACK alias). Panel.independent selects this renderer; shared scaled geometry preserves native values and source gaps. Text output reserves terminal columns for every scale; raster labels fit available space. Too-small views request enlargement rather than dropping scales. Native sources keep their own frequency and observation bounds; security intervals apply only to price sources. Quote/FRED view adapters skip their single-source guards when in comparison mode.
@@ -92,7 +130,7 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 - New function: subclass `View`, set `FUNC`, `hints` and `refresh_secs`. Implement `compose()` and `async load()` (fetch via `self.hub`). Use `key_x()` / `on_key` for single keys. Then `VIEWS.update({...})` at the bottom of the module, and import the module in `app.register()`.
 - Uppercase letters start symbol input; `/` starts command input. Both jump to the command line (`:` still focuses it). Commands require `/`: `/GP AAPL` or `AAPL /GP`, `/MON`, `/LAYOUT 2`; security search is `/? apple`. Bare words always mean symbols, including names such as `TOP` that also name commands. Internal `run_command` calls use the same syntax. Single-key controls must be lowercase; modal screens retain their own keys (including pager `/` search and `G`/`N`).
 - Saved legacy startup commands migrate once to slash syntax (`general.command_syntax = "slash"`). Autocomplete separates slash commands from symbols. Help text renders without markup so `[/FUNC]` is literal.
-- Blocking libraries go through `hub.yf_call` / `asyncio.to_thread`. HTTP goes through `hub.http(name, url, per_sec, headers, ttl, disk_ns, disk_age)`, which registers its limiter in the status bar automatically.
+- Views use `hub.query(typed_request)` or the compatibility facade; provider callables are no longer accepted by views. Named Yahoo operations use `hub.resource("yf", operation, **params)`. Ingestion owns blocking libraries and HTTP; repository I/O, decoding and analysis run in workers. `hub.http(...)` is a public-resource compatibility adapter, not a disk-cache API.
 - Fail soft. Exceptions in `load()` become a status-bar warning, and missing data renders `N/A`.
 - Options are securities for normal chart, watchlist, comparison, BOOK and DAT navigation, but search only returns
   them with `_t=OPTION` / `_t=OPTIONS`. Discovery fetches one underlying/expiry (nearest unless YYYY-MM-DD supplied),
@@ -112,6 +150,7 @@ DES/HP/CN/TOP/OMON, FA (2,270 AAPL filings in FIL), ERN, EVTS, `/? apple`, an un
 MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default User-Agent.
 
 ## Completed updates
+- [x] Features TODO pt2 §1 architecture migration (2026-10-24): separated ingestion, normalization, domain storage/indexing, typed query/analysis services and Textual adapters. Added durable SQLite observations/facts/filings/news/search, distinct provider and versioned derived caches, archival upserts with per-observation fetch times, bounded retention and explicit stale/unavailable provenance. Existing windows, indicators, comparisons, DAT and document extraction run in workers; indexed discovery preserves fuzzy and paginated results. Force refresh, scoped options refresh, cancellation, cache corruption and persistence failures retain valid data without hiding failures. Verified exact OHLCV/time-zone round trips, restart/offline reuse, input/parameter/logic invalidation, refresh races, retention isolation and zero-key operation. Actual CLI startup/confirmed exit passed; cached headless first paint was 0.29s. The final clean-store 27-command live smoke passed with only expected unknown-ticker/missing-key messages; ten additional live feature commands, full paginated FRED index/offline reuse, and existing pane/reader/options scripts passed. Updated README and architecture contracts. Physical-terminal graphics and IEX edge-case QA remain open below.
 - [x] Expanded STACKED scales (2026-10-24): removed the two-series limit; STACKED/STACK now accepts the same 1–8 references as other comparison modes. Each series has a distinct color and numbered native-value scale column, all on the left, in both raster and terminal-text output. Shared bounds preserve native values, source gaps, constants and crosshairs; renderer sizing reserves every scale and requests enlargement if the viewport is too narrow. Existing REAL/NORMALIZED behavior and mode switching are preserved. Verified 1/2/3/8-series validation and nine-series rejection, eight unique colors, all eight native headers/ticks on the left, mode transitions, resize/tiny viewport handling, constant/gapped series, crosshair and unchanged source frames. Visually inspected the eight-scale raster. App PTY startup/confirmed exit and four targeted live smoke commands (four mixed references, eight FRED references, REAL and STACK transitions) passed without warnings. Updated HELP, README and the ignored feature checklist.
 - [x] Next features batch §4 (2026-10-24): OMON now uses the shared popup, command history/help/completion and primary dot commands. Added expiry date/index/relative selection (including deferred initial selection), call/put side, strike centering/stepping, bounded window width, underlying changes, selected-contract charts/history/bid-ask books and scoped refresh. CHAIN on an option graph restores underlying/expiry/side/strike. Existing keyboard controls remain; invalid commands do not mutate their state, terminal navigation must be last, and stale or empty chains cannot open an old contract. Empty Yahoo chains display an explanation; REFRESH evicts the attempted expiry’s cache, including empty results. Verified mocked empty/missing data, exact refresh eviction, bounds/invalid inputs, deferred dates, popup/help/focus/completion, pane isolation, minute-case preservation and small-terminal notes layout. Live checks opened AAPL puts, returned via CHAIN, loaded seven native daily history bars and a MSFT contract bid/ask snapshot. App PTY startup/confirmed exit, the 27-command full live smoke, existing pane and reader/options interaction scripts, and targeted live commands passed without tracebacks. Yahoo name enrichment returned an HTTPError during the full smoke/retry, while search retained nine matches; the nearest AAPL chain was temporarily empty, while EXP NEXT loaded populated chains. A subsequent live check loaded 25 nearest-expiry rows and nine next-expiry rows, confirming recovery. Provider gaps remain explicit rather than fabricated.
 - [x] Next features batch §3 (2026-10-24): mixed-source comparisons accept securities/options plus _fred= or FRED: identifiers, and _ern= or ERN: earnings-surprise series. NORMALIZED uses the first common observation; REAL preserves values on one scale; STACKED supports two independently scaled traces with colored left/right axes in raster and text transports. MODE changes scaling without provider requests; CMP OFF restores the originating price/FRED graph. Dates align in New York time without backward fill or carrying past the last observation; zero baselines, disjoint windows and unavailable sources fail visibly. Verified aliases, invalid arguments/modes, native values, source bounds, normalization, restoration, text axis spans and a visually inspected dual-axis raster. PTY startup/confirmed exit and seven targeted live comparison smoke commands passed without warnings.

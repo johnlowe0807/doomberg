@@ -1,24 +1,24 @@
-"""Data layer: TTL/disk cache, rate limiter, Quote model, providers, DataHub facade.
+"""Compatibility facade and chart window math; UI data access uses typed queries.
 
-Views call DataHub only. Providers are swappable per asset class (fallback chain).
-All blocking libs (yfinance) run via asyncio.to_thread; never call them on the UI thread.
+Ingestion, normalization, repositories and query/analysis services are separate,
+UI-independent modules. DataHub keeps the established commands/views compatible.
 """
 from __future__ import annotations
-
 import asyncio
-import json
 import math
 import os
 import re
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import asdict, dataclass
 from decimal import Decimal
 from functools import lru_cache
 
-from .config import CACHE_DIR, Config
+from .config import HOME, Config, load_aliases
+from .query_models import Quote, Result, Metadata, QuotesQuery, HistoryQuery, ResourceQuery, AnalysisQuery, BarsQuery
+from .ingestion import RateLimiter, Provider, YFProvider, Ingestion, _sub
+from .query import QueryService
+from .serialization import key
 
-
-# ---------------------------------------------------------------- cache / limiter
 class TTLCache:
     def __init__(self) -> None:
         self._d: dict[str, tuple[float, object]] = {}
@@ -30,176 +30,12 @@ class TTLCache:
         return None
 
     def put(self, key: str, value, ttl: float) -> None:
+        if len(self._d) >= 512:
+            now = time.time()
+            self._d = {k: v for k, v in self._d.items() if v[0] > now}
+            if len(self._d) >= 512:
+                self._d.pop(next(iter(self._d)))
         self._d[key] = (time.time() + ttl, value)
-
-
-class DiskCache:
-    """JSON disk cache for slow-changing data (fundamentals, filings, FRED)."""
-
-    def __init__(self, ns: str) -> None:
-        self.dir = CACHE_DIR / ns
-        self.dir.mkdir(parents=True, exist_ok=True)
-
-    def _p(self, key: str):
-        return self.dir / ("".join(c if c.isalnum() or c in "-_." else "_" for c in key) + ".json")
-
-    def get(self, key: str, max_age: float | None = None):
-        try:
-            d = json.loads(self._p(key).read_text())
-            if max_age is None or time.time() - d["t"] < max_age:
-                return d["v"]
-        except Exception:
-            pass
-        return None
-
-    def put(self, key: str, value) -> None:
-        try:
-            self._p(key).write_text(json.dumps({"t": time.time(), "v": value}))
-        except Exception:
-            pass
-
-
-class RateLimiter:
-    """Min-interval limiter with exponential backoff on 429 / rate-limit errors."""
-
-    def __init__(self, name: str, per_sec: float, concurrency: int = 4) -> None:
-        self.name, self.gap = name, 1.0 / per_sec
-        self.sem = asyncio.Semaphore(concurrency)
-        self.next_ok = 0.0
-        self.backoff_until = 0.0
-        self.penalty = 0.0
-        self.latency = 0.0
-        self.err = ""
-
-    async def __aenter__(self):
-        await self.sem.acquire()
-        wait = max(self.next_ok, self.backoff_until) - time.time()
-        if wait > 0:
-            await asyncio.sleep(wait)
-        self.next_ok = time.time() + self.gap
-        self._t0 = time.time()
-        return self
-
-    async def __aexit__(self, et, e, tb):
-        self.sem.release()
-        if e is None:
-            self.latency, self.err, self.penalty = time.time() - self._t0, "", 0.0
-        elif "rate" in type(e).__name__.lower() or "429" in str(e):
-            self.penalty = min(300.0, max(5.0, self.penalty * 2))
-            self.backoff_until = time.time() + self.penalty
-            self.err = "429"
-        else:
-            self.err = "err"
-        return False
-
-    def state(self) -> str:
-        left = self.backoff_until - time.time()
-        if left > 0:
-            return f"{self.name}:backoff {left:.0f}s"
-        if self.err:
-            return f"{self.name}:{self.err}"
-        return f"{self.name}:ok {self.latency * 1000:.0f}ms"
-
-
-# ---------------------------------------------------------------- model
-@dataclass
-class Quote:
-    symbol: str
-    price: float | None = None
-    prev_close: float | None = None
-    volume: float | None = None
-    day_low: float | None = None
-    day_high: float | None = None
-    ts: float | None = None        # time of last trade/bar (epoch)
-    fetched: float = 0.0           # when we got it
-    source: str = "yf"
-    live: bool = False             # came from a stream
-
-    @property
-    def change(self):
-        return None if self.price is None or self.prev_close is None else self.price - self.prev_close
-
-    @property
-    def pct(self):
-        c = self.change
-        return None if c is None or not self.prev_close else 100 * c / self.prev_close
-
-    @property
-    def tag(self) -> str:
-        age = time.time() - self.fetched
-        if self.live and age < 30:
-            return "LIVE"
-        return "STALE" if age > 300 else "DLY"
-
-
-# ---------------------------------------------------------------- providers
-class Provider:
-    """Interface. Implement per source; unimplemented methods raise NotImplementedError."""
-    name = "base"
-
-    async def quote(self, symbols: list[str]) -> dict[str, Quote]: raise NotImplementedError
-    async def history(self, symbol: str, period: str, interval: str): raise NotImplementedError
-    async def options(self, symbol: str, expiry: str | None = None): raise NotImplementedError
-    async def stream(self, symbols: list[str], on_quote) -> None: raise NotImplementedError
-
-
-def _sub(df, sym):
-    """Pick one ticker's columns out of a yf.download frame (handles MultiIndex either way)."""
-    import pandas as pd
-    if not isinstance(df.columns, pd.MultiIndex):
-        return df
-    if sym in df.columns.get_level_values(0):
-        return df[sym]
-    if sym in df.columns.get_level_values(1):
-        return df.xs(sym, axis=1, level=1)
-    return None
-
-
-class YFProvider(Provider):
-    name = "yf"
-
-    def __init__(self, limiter: RateLimiter) -> None:
-        self.lim = limiter
-
-    async def quote(self, symbols):
-        def work():
-            import yfinance as yf
-            kw = dict(group_by="ticker", progress=False, threads=True, auto_adjust=False)
-            d = yf.download(symbols, period="5d", interval="1d", **kw)
-            try:
-                m = yf.download(symbols, period="1d", interval="1m", **kw)
-            except Exception:
-                m = None
-            out, now = {}, time.time()
-            for s in symbols:
-                q = Quote(s, fetched=now)
-                dd = _sub(d, s)
-                if dd is not None and "Close" in dd:
-                    dd = dd.dropna(subset=["Close"])
-                    if len(dd):
-                        last = dd.iloc[-1]
-                        q.price, q.volume = float(last["Close"]), float(last.get("Volume", 0) or 0)
-                        q.day_low, q.day_high = float(last["Low"]), float(last["High"])
-                        q.ts = dd.index[-1].timestamp()
-                        if len(dd) > 1:
-                            q.prev_close = float(dd.iloc[-2]["Close"])
-                mm = _sub(m, s) if m is not None else None
-                if mm is not None and "Close" in mm:
-                    mm = mm.dropna(subset=["Close"])
-                    if len(mm):
-                        q.price, q.ts = float(mm.iloc[-1]["Close"]), mm.index[-1].timestamp()
-                if q.price is not None:
-                    out[s] = q
-            return out
-        async with self.lim:
-            return await asyncio.to_thread(work)
-
-    async def history(self, symbol, period="1y", interval="1d"):
-        def work():
-            import yfinance as yf
-            return yf.Ticker(symbol).history(period=period, interval=interval)
-        async with self.lim:
-            return await asyncio.to_thread(work)
 
 
 # ---------------------------------------------------------------- chart bars
@@ -425,216 +261,193 @@ def slice_range(df, rng: str):
     return df[idx >= start]
 
 
-# ---------------------------------------------------------------- hub
+
+def base_for(rng: str, iv: str):
+    interval = candle_interval(iv)
+    need, days = interval.minutes, range_days(rng)
+    if need >= range_span_days(rng) * 1440:
+        return None
+    best = None
+    for biv, period, cover, ttl in BASES:
+        if (biv == '1d' if interval.months else need % IV_MIN[biv] == 0) and cover >= days:
+            best = (biv, period, ttl)
+    return best
+
+
 class DataHub:
-    """Single facade the UI talks to. Fail soft: return {} / None, record status."""
-
+    """View adapter. Typed query results remain available through `query`."""
     QUOTE_TTL, HIST_TTL = 5.0, 60.0
+    base_for = staticmethod(base_for)
 
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config):
         self.cfg = config
-        self.mem = TTLCache()
-        self.disk = DiskCache("snap")
-        self.limiters = {"yf": RateLimiter("yf", 2.0, 4)}
-        self.yf = YFProvider(self.limiters["yf"])
-        self.quote_chain: list[Provider] = [self.yf]   # fresh Coinbase quotes in self.last bypass polling
-        self.last: dict[str, Quote] = {}
-        self.warnings: list[str] = []
-        self.streams: dict[str, str] = {}          # stream name -> state, shown in status bar
-        self.iex: dict[str, dict] = {}             # sym -> {"price", "ts", "via"} (Alpaca IEX last trade)
-        self.watch: dict[str, float] = {}          # sym -> last time a view asked for it (stream priority)
-        self._inflight: dict[str, asyncio.Future] = {}
-        snap = self.disk.get("quotes") or {}
-        for s, d in snap.items():                      # first paint from disk; shows STALE until refreshed
-            try:
-                self.last[s] = Quote(**d)
-            except TypeError:
-                pass
-        self.alpaca_ok = False  # Only validate_alpaca may enable this, after an HTTP 200.
-        self.alpaca_reason = "Alpaca keys awaiting validation" if (
-            os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET")
-        ) else "no ALPACA_API_KEY/ALPACA_API_SECRET"
+        self.mem = TTLCache()  # small UI/live snapshot cache; never the observation store
+        self.limiters = {'yf': RateLimiter('yf', 2.0, 4)}
+        self.yf = YFProvider(self.limiters['yf'])
+        self.quote_chain = [self.yf]
+        self.last = {}
+        self.warnings = []
+        self.streams = {}
+        self.iex = {}
+        self.watch = {}
+        self.queries = QueryService(HOME, Ingestion(config, self.limiters, self.yf), self.warn)
+        self.queries.aliases = load_aliases()
+        self.provenance = {}
+        self._live_saved = {}
+        self.alpaca_ok = False
+        self.alpaca_reason = 'Alpaca keys awaiting validation' if (
+            os.environ.get('ALPACA_API_KEY') and os.environ.get('ALPACA_API_SECRET')) else 'no ALPACA_API_KEY/ALPACA_API_SECRET'
 
-    def warn(self, msg: str) -> None:
-        self.warnings = (self.warnings + [msg])[-5:]
+    def warn(self, msg):
+        if msg and (not self.warnings or self.warnings[-1] != msg):
+            self.warnings = (self.warnings + [msg])[-5:]
 
-    async def validate_alpaca(self) -> None:
-        """GET latest IEX trade; anything but 200 disables the overlay permanently for the session."""
-        if not (os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET")):
-            self.alpaca_ok = False
-            self.alpaca_reason = "no ALPACA_API_KEY/ALPACA_API_SECRET"
-            if self.cfg.get("iex", "enabled"):
-                self.cfg.set("iex", "enabled", False)
-            return
+    async def initialize(self):
+        await self.queries.initialize()
         try:
-            import httpx
-            h = {"APCA-API-KEY-ID": os.environ["ALPACA_API_KEY"],
-                 "APCA-API-SECRET-KEY": os.environ["ALPACA_API_SECRET"]}
-            async with httpx.AsyncClient(timeout=8) as c:
-                r = await c.get("https://data.alpaca.markets/v2/stocks/SPY/trades/latest?feed=iex", headers=h)
-            if r.status_code != 200:
-                self.alpaca_ok, self.alpaca_reason = False, f"Alpaca keys rejected (HTTP {r.status_code})"
-            else:
-                self.alpaca_ok, self.alpaca_reason = True, ""
-        except Exception as e:
-            self.alpaca_ok, self.alpaca_reason = False, f"Alpaca unreachable ({type(e).__name__})"
-        if not self.alpaca_ok and self.cfg.get("iex", "enabled"):
-            self.cfg.set("iex", "enabled", False)
+            snapshots = await asyncio.to_thread(self.queries.repository.quote_snapshot)
+        except Exception as error:
+            self.warn(f'Stored quotes unreadable: {type(error).__name__}; fetching fresh data')
+            snapshots = []
+        for item in snapshots:
+            if item:
+                data, meta = item
+                quote = Quote(**data)
+                quote.live = False
+                quote.stale = time.time() - meta.fetched_at >= 5
+                self.last[quote.symbol] = quote
 
-    def cached_quotes(self, symbols: list[str]) -> dict[str, Quote]:
+    async def query(self, request, *, force=False, stored_only=False):
+        result = await self.queries.query(request, force=force, stored_only=stored_only)
+        identity = self.queries.identity(request)
+        self.provenance[identity] = result.meta
+        if len(self.provenance) > 256:
+            self.provenance.pop(next(iter(self.provenance)))
+        if result.meta.freshness != 'fresh':
+            self.warn(('STALE stored fallback · ' if result.meta.freshness == 'stale' else 'N/A · ') + result.meta.reason)
+        return result
+
+    @staticmethod
+    def value(result):
+        data = result.data
+        if hasattr(data, 'calls') and hasattr(data, 'puts'):
+            from types import SimpleNamespace
+            data = SimpleNamespace(calls=data.calls, puts=data.puts, underlying=getattr(data, 'underlying', {}),
+                                   freeterm=asdict(result.meta))
+        if hasattr(data, 'attrs'):
+            data = data.copy()
+            data.attrs['freeterm'] = asdict(result.meta)
+        return data
+
+    async def resource(self, source, operation, **params):
+        return self.value(await self.query(ResourceQuery(source, operation, params)))
+
+    async def validate_alpaca(self):
+        if not (os.environ.get('ALPACA_API_KEY') and os.environ.get('ALPACA_API_SECRET')):
+            self.alpaca_ok, self.alpaca_reason = False, 'no ALPACA_API_KEY/ALPACA_API_SECRET'
+        else:
+            request = ResourceQuery('alpaca', 'validate', {
+                'url': 'https://data.alpaca.markets/v2/stocks/SPY/trades/latest?feed=iex', '_ttl': 0, 'retries': 0})
+            result = await self.query(request, force=True)
+            self.alpaca_ok = result.data is not None and result.meta.freshness == 'fresh'
+            self.alpaca_reason = '' if self.alpaca_ok else 'Alpaca keys rejected or unreachable'
+        if not self.alpaca_ok and self.cfg.get('iex', 'enabled'):
+            self.cfg.set('iex', 'enabled', False)
+
+    def cached_quotes(self, symbols):
         return {s: self.last[s] for s in symbols if s in self.last}
 
-    async def quotes(self, symbols: list[str]) -> dict[str, Quote]:
+    async def quotes(self, symbols):
         from .options import contract, snapshot
         for symbol in symbols:
-            if contract(symbol) and self.mem.get("q:" + symbol) is None:
+            if contract(symbol) and self.mem.get('q:' + symbol) is None:
                 await snapshot(self, symbol)
-        need = [s for s in symbols if self.mem.get("q:" + s) is None and not self.live_fresh(s)]
+        need = [s for s in symbols if not self.live_fresh(s) and self.mem.get('q:' + s) is None]
         if need:
-            for prov in self.quote_chain:
-                try:
-                    got = await prov.quote(need)
-                except Exception as e:
-                    self.warn(f"{prov.name} quote failed: {type(e).__name__}")
-                    continue
-                for s, q in got.items():
-                    if self.live_fresh(s):      # a stream update landed while we were polling
-                        continue
-                    self.last[s] = q
-                    self.mem.put("q:" + s, q, self.QUOTE_TTL)
-                need = [s for s in need if s not in got]
-                if not need:
-                    break
-            self.disk.put("quotes", {s: asdict(q) for s, q in self.last.items()})
+            result = await self.query(QuotesQuery(tuple(need)))
+            for symbol, data in (result.data or {}).items():
+                if not self.live_fresh(symbol):
+                    quote = Quote(**data)
+                    quote.stale = quote.stale or time.time() - quote.fetched >= 5
+                    self.last[symbol] = quote
+                    if not quote.stale:
+                        self.mem.put('q:' + symbol, quote, 5)
         return self.cached_quotes(symbols)
 
-    async def history(self, symbol: str, period="1y", interval="1d"):
-        key = f"h:{symbol}:{period}:{interval}"
-        hit = self.mem.get(key)
-        if hit is not None:
-            return hit
+    async def publish_quote(self, quote):
+        """Persist stream observations at most once per five seconds per source/symbol."""
+        self.last[quote.symbol] = quote
+        identity = 'quote:' + quote.symbol
+        if time.time() - self._live_saved.get(identity, 0) < 5:
+            return
+        self._live_saved[identity] = time.time()
+        await self.queries.initialize()
         try:
-            df = await self.yf.history(symbol, period, interval)
-        except Exception as e:
-            self.warn(f"history {symbol} failed: {type(e).__name__}")
-            return None
-        self.mem.put(key, df, self.HIST_TTL)
-        return df
+            await asyncio.to_thread(self.queries.repository.put, identity, 'quote', quote.source,
+                                    asdict(quote), quote.fetched, quote.ts)
+        except Exception as error:
+            self.warn(f'Live quote storage failed: {type(error).__name__}; stream continues')
 
-    # -- chart bars: a few base downloads per symbol; every range/interval is derived locally from them
-    def base_for(self, rng: str, iv: str):
-        """Coarsest base dataset that can produce `iv` bars covering `rng`, or None if no free source can."""
-        interval = candle_interval(iv)
-        need, days = interval.minutes, range_days(rng)
-        if need >= range_span_days(rng) * 1440:           # one bar (or less) per range is not a chart
-            return None
-        best = None
-        for biv, period, cover, ttl in BASES:
-            if (biv == "1d" if interval.months else need % IV_MIN[biv] == 0) and cover >= days:
-                best = (biv, period, ttl)
-        return best
-
-    async def _base(self, sym: str, biv: str, period: str, ttl: float):
-        key = f"b:{sym}:{biv}"
-        hit = self.mem.get(key)
-        if hit is not None:
-            return hit
-        inflight = self._inflight.get(key)
-        if inflight is not None:          # someone is already downloading it: share the result
-            return await asyncio.shield(inflight)
-        fut = asyncio.get_running_loop().create_future()
-        self._inflight[key] = fut
-        df = None
+    async def publish_iex(self, symbol, record):
+        self.iex[symbol] = record
+        identity = 'iex:' + symbol
+        if time.time() - self._live_saved.get(identity, 0) < 5:
+            return
+        self._live_saved[identity] = time.time()
+        await self.queries.initialize()
         try:
-            df = await self.yf.history(sym, period, biv)
-            if df is not None and len(df):
-                df = df[["Open", "High", "Low", "Close", "Volume"]].dropna(subset=["Close"])
-                df = flag_bad_volume(df) if biv == "1m" else df.assign(BadVol=False)
-                self.mem.put(key, df, ttl)
-        except Exception as e:
-            self.warn(f"bars {sym} {biv}: {type(e).__name__}")
-            df = None
-        finally:
-            fut.set_result(df)
-            self._inflight.pop(key, None)
-        return df
+            await asyncio.to_thread(self.queries.repository.put, identity, 'document', 'alpaca', record,
+                                    time.time(), record.get('ts'))
+        except Exception as error:
+            self.warn(f'IEX storage failed: {type(error).__name__}; stream continues')
 
-    async def bars(self, sym: str, rng: str, iv: str):
-        """OHLCV for (range, interval), built from a cached base download. Returns a private copy or None."""
-        b = self.base_for(rng, iv)
-        if b is None:
-            return None
-        df = await self._base(sym, *b)
-        if df is None or not len(df):
-            return None
-        # Select the requested window before bucketing so custom/long candles cannot pull in older bars.
-        df = slice_range(df, rng)
-        if candle_interval(iv).value != b[0]:
-            df = resample_ohlcv(df, iv)
-        return df.copy()
+    async def history(self, symbol, period='1y', interval='1d'):
+        return self.value(await self.query(HistoryQuery(symbol, period, interval)))
 
-    async def prefetch_bars(self, sym: str) -> None:
-        """Warm every base for a symbol (coarse first: daily ranges are flipped most), one at a time."""
-        for biv, period, _cover, ttl in reversed(BASES):
+    async def _base(self, sym, biv, period, ttl):
+        return await self.history(sym, period, biv)
+
+    async def bars(self, sym, rng, iv):
+        return self.value(await self.query(BarsQuery(sym, rng, iv)))
+
+    async def prefetch_bars(self, sym):
+        for biv, period, _, ttl in reversed(BASES):
             await self._base(sym, biv, period, ttl)
 
-    async def yf_call(self, key: str, ttl: float, fn):
-        """Run a blocking yfinance callable in a thread under the yf limiter, memory-cached for ttl seconds."""
-        hit = self.mem.get(key)
-        if hit is not None:
-            return hit
-        try:
-            async with self.limiters["yf"]:
-                v = await asyncio.to_thread(fn)
-        except Exception as e:
-            self.warn(f"yf {key}: {type(e).__name__}")
-            return None
-        self.mem.put(key, v, ttl)
-        return v
+    async def derive(self, name, params, frames, compute, version):
+        metadata = [Metadata(**f.attrs['freeterm']) for f in frames if f.attrs.get('freeterm')]
+        versions = []
+        for frame in frames:
+            versions.append(await asyncio.to_thread(key, frame))
+            if frame.attrs.get('freeterm', {}).get('version'):
+                versions.append(frame.attrs['freeterm']['version'])
+        versions = tuple(versions)
+        result = await self.queries.analysis(AnalysisQuery(name, params, versions, version), compute, inputs=tuple(metadata))
+        return self.value(result)
 
-    @property
-    def client(self):
-        if getattr(self, "_client", None) is None:
-            import httpx
-            self._client = httpx.AsyncClient(timeout=25, follow_redirects=True)
-        return self._client
+    async def http(self, name, url, per_sec=2.0, headers=None, ttl=60, disk_ns=None, disk_age=None,
+                   as_json=True, retries=2):
+        # Compatibility for public HTTP resources; normalized feature services sit above it.
+        return await self.resource(name, disk_ns or name, url=url, per_sec=per_sec, headers=headers,
+                                   _ttl=disk_age if disk_age is not None else ttl, as_json=as_json, retries=retries)
 
-    async def http(self, name: str, url: str, per_sec: float = 2.0, headers: dict | None = None,
-                   ttl: float = 60, disk_ns: str | None = None, disk_age: float | None = None,
-                   as_json: bool = True, retries: int = 2):
-        """Rate-limited GET with memory cache, optional persistent disk cache, 429 backoff, stale fallback."""
-        hit = self.mem.get(url)
-        if hit is not None:
-            return hit
-        disk = DiskCache(disk_ns) if disk_ns else None
-        if disk:
-            v = disk.get(url, disk_age)
-            if v is not None:
-                self.mem.put(url, v, ttl)
-                return v
-        lim = self.limiters.setdefault(name, RateLimiter(name, per_sec, 2))
-        for attempt in range(retries + 1):
-            try:
-                async with lim:
-                    r = await self.client.get(url, headers=headers)
-                    if r.status_code == 429:
-                        raise RuntimeError("429 rate limited")
-                    r.raise_for_status()
-                v = r.json() if as_json else r.text
-                break
-            except Exception as e:
-                if attempt == retries or "429" not in str(e):
-                    self.warn(f"{name}: {type(e).__name__} {str(e)[:60]}")
-                    return disk.get(url) if disk else None   # stale beats nothing
-        self.mem.put(url, v, ttl)
-        if disk:
-            disk.put(url, v)
-        return v
+    def invalidate_resource(self, source, operation, **params):
+        self.queries.invalidate(ResourceQuery(source, operation, params))
 
-    def live_fresh(self, s: str) -> bool:
-        q = self.last.get(s)
-        return bool(q and q.live and time.time() - q.fetched < 30)
+    def force_refresh(self):
+        self.mem = TTLCache()
+        self.queries.refresh()
 
-    def status(self) -> str:
-        parts = [l.state() for l in self.limiters.values()] + [f"{k}:{v}" for k, v in self.streams.items()]
-        return " ".join(parts)
+    def live_fresh(self, symbol):
+        quote = self.last.get(symbol)
+        return bool(quote and quote.live and time.time() - quote.fetched < 30)
+
+    def status(self):
+        parts = [lim.state() for lim in self.limiters.values()] + [f'{k}:{v}' for k, v in self.streams.items()]
+        stale = sum(m.freshness == 'stale' for m in self.provenance.values())
+        if stale:
+            parts.append(f'data:STALE {stale}')
+        return ' '.join(parts)
+
+    async def close(self):
+        await self.queries.close()

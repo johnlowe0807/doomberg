@@ -2,9 +2,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import time
-from dataclasses import asdict
 
 import pandas as pd
 import numpy as np
@@ -16,30 +14,10 @@ from textual.widgets import DataTable, Static
 
 from .app import DIM, WARN, VIEWS, View, MonView, PromptScreen, fbig, fnum, colored, tag_text
 from .charts import QuoteChartView, HomePreview, fred, PALETTE
-from .data import Quote, RateLimiter, _sub
+from .data import Quote
 from .pixelcharts import ChartSurface, Panel, Scene, Trace
 
-BOARDS = {
-    "WEI": [("^GSPC", "S&P 500"), ("^DJI", "Dow Jones"), ("^IXIC", "Nasdaq Comp"), ("^RUT", "Russell 2000"),
-            ("^VIX", "VIX"), ("^GSPTSE", "TSX"), ("^BVSP", "Bovespa"), ("^FTSE", "FTSE 100"), ("^GDAXI", "DAX"),
-            ("^FCHI", "CAC 40"), ("^STOXX50E", "Euro Stoxx 50"), ("^N225", "Nikkei 225"), ("^HSI", "Hang Seng"),
-            ("000001.SS", "Shanghai"), ("^KS11", "KOSPI"), ("^AXJO", "ASX 200"), ("^BSESN", "Sensex")],
-    "CMDTY": [("CL=F", "WTI Crude"), ("BZ=F", "Brent"), ("NG=F", "Nat Gas"), ("RB=F", "RBOB Gas"), ("HO=F", "Heating Oil"),
-              ("GC=F", "Gold"), ("SI=F", "Silver"), ("HG=F", "Copper"), ("PL=F", "Platinum"), ("PA=F", "Palladium"),
-              ("ZC=F", "Corn"), ("ZW=F", "Wheat"), ("ZS=F", "Soybeans"), ("KC=F", "Coffee"), ("SB=F", "Sugar"),
-              ("CC=F", "Cocoa"), ("CT=F", "Cotton"), ("LE=F", "Live Cattle"),
-              ("ALI=F", "Aluminum"), ("LBR=F", "Lumber"), ("KE=F", "KC HRW Wheat"), ("ZO=F", "Oats"),
-              ("ZR=F", "Rough Rice"), ("ZM=F", "Soybean Meal"), ("ZL=F", "Soybean Oil"),
-              ("GF=F", "Feeder Cattle"), ("HE=F", "Lean Hogs"), ("OJ=F", "Orange Juice")],
-    "CRYPTO": [(f"{c}-USD", c) for c in ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "LTC", "DOT", "BCH")],
-    "FXL": [("EURUSD=X", "EUR/USD"), ("GBPUSD=X", "GBP/USD"), ("JPY=X", "USD/JPY"), ("CHF=X", "USD/CHF"),
-            ("AUDUSD=X", "AUD/USD"), ("CAD=X", "USD/CAD"), ("NZDUSD=X", "NZD/USD"), ("CNY=X", "USD/CNY"),
-            ("MXN=X", "USD/MXN"), ("DX-Y.NYB", "Dollar Index")],
-    "MOSTU": [(s, s) for s in "AAPL MSFT NVDA AMZN GOOGL META TSLA AVGO JPM V LLY UNH XOM MA COST HD PG JNJ ABBV NFLX "
-              "CRM AMD ORCL BAC KO PEP MRK WMT ADBE CSCO INTC QCOM TXN MU PLTR UBER COIN SMCI BA DIS".split()],
-}
-TAPE = [("^GSPC", "SPX"), ("^DJI", "INDU"), ("^IXIC", "CCMP"), ("^RUT", "RTY"), ("^VIX", "VIX"), ("CL=F", "CL1"),
-        ("GC=F", "GOLD"), ("EURUSD=X", "EUR"), ("BTC-USD", "BTC")]
+from .catalog import BOARDS, TAPE
 
 
 class QuoteBoard(View):
@@ -100,19 +78,8 @@ class CmdtyBoard(QuoteBoard):
         return "CMDTY prior-day volume (50 max, curated futures)"
 
     def on_mount(self):
-        symbols = ",".join(s for s, _ in BOARDS[self.board][:self.LIMIT])
-        self.snapshot_key = "cmdty-daily-" + hashlib.sha256(symbols.encode()).hexdigest()[:16]
-        snapshot = self.hub.disk.get(self.snapshot_key) or {}
-        today = str(pd.Timestamp.now(tz="America/New_York").date())
-        cache_key = f"{self.snapshot_key}:{today}"
-        fetched = min((q["fetched"] for q in snapshot.get("quotes", {}).values()), default=0)
-        remaining = self.refresh_secs - (time.time() - fetched)
-        if remaining > 0 and snapshot.get("rank_date") == today and self.hub.mem.get(cache_key) is None:
-            self.hub.mem.put(cache_key, snapshot, remaining)
-        self.volumes = snapshot.get("volumes", {})
+        self.volumes = {}
         super().on_mount()
-        if snapshot:
-            self.render_rows({s: Quote(**q) for s, q in snapshot.get("quotes", {}).items()})
 
     def ordered(self, qs):
         def rank(row):
@@ -129,36 +96,8 @@ class CmdtyBoard(QuoteBoard):
         symbols = [s for s, _ in self.rows][:self.LIMIT]
         today = pd.Timestamp.now(tz="America/New_York").date()
 
-        def download():
-            import yfinance as yf
-            # Daily bars supply both quotes and ranking: no extra intraday requests.
-            frame = yf.download(symbols, period="5d", interval="1d", group_by="ticker",
-                                auto_adjust=False, progress=False, threads=False)
-            snapshot = {"quotes": {}, "volumes": {}, "rank_date": str(today)}
-            for symbol in symbols:
-                bars = _sub(frame, symbol)
-                if bars is None or "Close" not in bars:
-                    continue
-                bars = bars.dropna(subset=["Close"])
-                if bars.empty:
-                    continue
-                last = bars.iloc[-1]
-                number = lambda v: float(v) if pd.notna(v) else None
-                quote = Quote(symbol, price=number(last["Close"]),
-                              prev_close=number(bars.iloc[-2]["Close"]) if len(bars) > 1 else None,
-                              volume=number(last.get("Volume")), day_low=number(last.get("Low")),
-                              day_high=number(last.get("High")), ts=bars.index[-1].timestamp(), fetched=time.time())
-                snapshot["quotes"][symbol] = asdict(quote)
-                prior = bars[bars.index.date < today]
-                if not prior.empty and "Volume" in prior:
-                    snapshot["volumes"][symbol] = {
-                        "volume": number(prior.iloc[-1]["Volume"]), "date": str(prior.index[-1].date())}
-            return snapshot if snapshot["quotes"] else None
-
-        # Share the five-minute cache; Ctrl+R clears memory to request a fresh batch.
-        snapshot = await self.hub.yf_call(f"{self.snapshot_key}:{today}", self.refresh_secs, download)
+        snapshot = await self.hub.resource("yf", "commodity", symbols=tuple(symbols), date=str(today))
         if snapshot:
-            self.hub.disk.put(self.snapshot_key, snapshot)
             self.volumes = snapshot["volumes"]
             self.render_rows({s: Quote(**q) for s, q in snapshot["quotes"].items()})
         else:
@@ -182,10 +121,9 @@ class MostBoard(QuoteBoard):
         super().on_mount()
 
     async def load(self) -> None:
-        import yfinance as yf
         mode = self.modes[self.m]
         query = {"gainers": "day_gainers", "losers": "day_losers", "active": "most_actives"}[mode]
-        data = await self.hub.yf_call(f"screen:{query}", 300, lambda: yf.screen(query, count=50))
+        data = await self.hub.resource("yf", "screen", screen=query)
         quotes, rows = {}, []
         for item in (data or {}).get("quotes", []):
             symbol, price = item.get("symbol"), item.get("regularMarketPrice")
@@ -320,8 +258,7 @@ class HomeView(View):
 
 
 # ---------------------------------------------------------------- bonds
-TENORS = [("1M", "DGS1MO"), ("3M", "DGS3MO"), ("6M", "DGS6MO"), ("1Y", "DGS1"), ("2Y", "DGS2"), ("3Y", "DGS3"),
-          ("5Y", "DGS5"), ("7Y", "DGS7"), ("10Y", "DGS10"), ("20Y", "DGS20"), ("30Y", "DGS30")]
+from .catalog import TENORS
 
 
 def asof(s: pd.Series | None, when: pd.Timestamp):
@@ -435,17 +372,12 @@ class AuctView(View):
         yield DataTable(cursor_type="row")
 
     async def load(self) -> None:
-        import httpx
-        lim = self.hub.limiters.setdefault("fiscal", RateLimiter("fiscal", 2, 2))
-        async with lim:
-            async with httpx.AsyncClient(timeout=20) as c:
-                r = await c.get(self.URL)
-                r.raise_for_status()
+        data = await self.hub.resource("fiscal", "fiscal", url=self.URL)
         t = self.query_one(DataTable)
         t.clear(columns=True)
         t.add_columns("Date", "Type", "Term", "CUSIP", "High Yld/Rate", "Bid/Cover", "Offering")
         ok = lambda v: v not in (None, "", "null")
-        for d in r.json().get("data", []):
+        for d in (data or {}).get("data", []):
             if not ok(d.get("bid_to_cover_ratio")):
                 continue
             y = next((d[k] for k in ("high_yield", "high_investment_rate", "high_discnt_rate") if ok(d.get(k))), None)

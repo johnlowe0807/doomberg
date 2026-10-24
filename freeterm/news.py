@@ -24,62 +24,7 @@ def web_url(url: str) -> bool:
         return False
 
 
-def readable_text(raw: str) -> str:
-    soup = BeautifulSoup(raw, "lxml")
-    for tag in soup.select("script, style, nav, aside, footer, form, button, noscript, [hidden], [aria-hidden='true']"):
-        tag.decompose()
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
-    for tag in soup.find_all(["p", "div", "li", "h1", "h2", "h3", "h4", "blockquote", "pre"]):
-        tag.append("\n\n")
-    text = re.sub(r"[ \t\xa0]+", " ", soup.get_text())
-    text = "\n".join(line.strip() for line in text.splitlines())
-    return re.sub(r"\n{3,}", "\n\n", text).strip()
-
-
-def extract_article(raw: str) -> str:
-    """Prefer article containers and structured article bodies, never whole-page chrome."""
-    soup = BeautifulSoup(raw, "lxml")
-    for selector in (".caas-body", '[data-testid="article-body"]', '[itemprop="articleBody"]',
-                     ".article-body", ".article-content", ".entry-content"):
-        node = soup.select_one(selector)
-        if node:
-            text = readable_text(str(node))
-            if len(text) >= 120:
-                return text
-
-    def bodies(value):
-        if isinstance(value, list):
-            for item in value:
-                yield from bodies(item)
-        elif isinstance(value, dict):
-            # Don't use embedded paid article bodies to get around publisher restrictions.
-            if str(value.get("isAccessibleForFree", True)).lower() == "false":
-                return
-            body = value.get("articleBody")
-            if isinstance(body, str):
-                yield body
-            for key in ("@graph", "mainEntity"):
-                yield from bodies(value.get(key))
-
-    for script in soup.select('script[type="application/ld+json"]'):
-        try:
-            for body in bodies(json.loads(script.string or script.get_text())):
-                text = readable_text(body)
-                if len(text) >= 120:
-                    return text
-        except (ValueError, TypeError):
-            continue
-    node = soup.find("article")
-    if node:
-        blocks = node.select("p, h2, h3, h4, li, blockquote, pre")
-        block_ids = {id(block) for block in blocks}
-        blocks = [b for b in blocks if not b.find_parent(["nav", "aside", "footer", "header", "form"])
-                  and not any(id(parent) in block_ids for parent in b.parents)]
-        text = readable_text("\n".join(str(b) for b in blocks))
-        if len(text) >= 120:
-            return text
-    return ""
+from .normalization import readable_text, extract_article
 
 
 class BrowserConfirm(ConfirmScreen):
@@ -131,13 +76,9 @@ class ArticleReader(Pager):
         body = ""
         try:
             if web_url(url):
-                body = self.hub.mem.get("article-text:" + url) or ""
-                if not body:
-                    raw = await self.hub.http("articles", url, 1, {"User-Agent": "Mozilla/5.0 freeterm"},
-                                              ttl=3600, as_json=False, retries=0)
-                    body = await asyncio.to_thread(extract_article, raw) if raw else ""
-                    if body:
-                        self.hub.mem.put("article-text:" + url, body, 3600)
+                from .query_models import TextQuery
+                result = await self.hub.query(TextQuery('articles', url))
+                body = result.data or ''
             if not body:
                 summary = await asyncio.to_thread(readable_text, self.item.get("summary") or "")
                 body = "Article text is unavailable in the terminal."

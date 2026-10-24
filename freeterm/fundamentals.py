@@ -43,54 +43,16 @@ async def cik_for(hub, sym: str) -> int | None:
 
 
 async def companyfacts(hub, cik: int):
-    return await sec_get(hub, f"https://data.sec.gov/api/xbrl/companyfacts/CIK{cik:010d}.json", "secfacts", 86400)
+    from .query_models import FactsQuery
+    return hub.value(await hub.query(FactsQuery(cik)))
 
 
 async def filings(hub, cik: int) -> list[dict]:
-    """All filings from the submissions index, including the older paginated files."""
-    d = await sec_get(hub, f"https://data.sec.gov/submissions/CIK{cik:010d}.json", "secsub", 86400)
-    if not d:
-        return []
-    pages = [d["filings"]["recent"]]
-    for f in d["filings"].get("files", []):
-        p = await sec_get(hub, f"https://data.sec.gov/submissions/{f['name']}", "secsub", None)  # old pages never change
-        if p:
-            pages.append(p)
-    out = []
-    for pg in pages:
-        n = len(pg.get("accessionNumber", []))
-        col = lambda k, i: (pg.get(k) or [""] * n)[i]
-        for i in range(n):
-            out.append({"acc": col("accessionNumber", i), "date": col("filingDate", i), "form": col("form", i),
-                        "doc": col("primaryDocument", i), "desc": col("primaryDocDescription", i),
-                        "items": col("items", i), "period": col("reportDate", i)})
-    out.sort(key=lambda r: r["date"], reverse=True)
-    return out
+    from .query_models import FilingsQuery
+    return hub.value(await hub.query(FilingsQuery(cik))) or []
 
 
-def html_to_text(raw: str) -> str:
-    from bs4 import BeautifulSoup
-    raw = re.sub(r"<TEXT>\s*begin \d{3} .*?end\s*</TEXT>", "<TEXT>[binary attachment omitted]</TEXT>", raw, flags=re.S)
-    if not re.search(r"<(html|body|div|p|table)\b", raw[:200000], re.I):
-        return raw
-    soup = BeautifulSoup(raw, "lxml")
-    for tag in soup.find_all(["script", "style", "ix:header", "head"]):
-        tag.decompose()
-    for tag in soup.find_all(style=re.compile(r"display:\s*none", re.I)):
-        tag.decompose()
-    for br in soup.find_all("br"):
-        br.replace_with("\n")
-    for td in soup.find_all(["td", "th"]):
-        td.append("  ")
-    for tag in soup.find_all(["p", "div", "tr", "li", "h1", "h2", "h3", "h4", "h5", "h6", "table", "document"]):
-        tag.append("\n")
-    lines = [re.sub(r"[ \t\xa0​]+", " ", l).strip() for l in soup.get_text("").splitlines()]
-    out, blank = [], 0
-    for l in lines:
-        blank = blank + 1 if not l else 0
-        if blank <= 1:
-            out.append(l)
-    return "\n".join(out).strip()
+from .normalization import html_to_text
 
 
 async def filing_text(hub, cik: int, f: dict, exhibit_991: bool = False) -> str:
@@ -103,10 +65,11 @@ async def filing_text(hub, cik: int, f: dict, exhibit_991: bool = False) -> str:
         pick = pick or [n for n in names if "99" in n and re.search(r"\.(htm|html|txt)$", n, re.I)]
         doc = pick[0] if pick else doc
     url = f"{base}/{doc}" if doc else f"https://www.sec.gov/Archives/edgar/data/{cik}/{f['acc']}.txt"
-    raw = await sec_get(hub, url, "secdocs", None, as_json=False)
-    if not raw:
+    from .query_models import TextQuery
+    result = await hub.query(TextQuery('sec', url))
+    if not result.data:
         return f"Could not fetch {url}"
-    return f"{url}\n\n" + await asyncio.to_thread(html_to_text, raw)
+    return f"{url}\n\n" + result.data
 
 
 # ---------------------------------------------------------------- pager
@@ -449,10 +412,9 @@ class FaView(View):
             f"{name} · {'annual' if self.annual else 'quarterly'} · {span} · source: {self.src}", style="bold #FFFFFF"))
 
     async def yf_fallback(self) -> None:
-        import yfinance as yf
         attr = {"income": "income_stmt", "balance": "balance_sheet", "cash": "cashflow"}[self.stmt]
         attr = attr if self.annual else "quarterly_" + attr
-        df = await self.hub.yf_call(f"fa:{self.sec}:{attr}", 3600, lambda: getattr(yf.Ticker(self.sec), attr))
+        df = await self.hub.resource("yf", "financials", symbol=self.sec, statement=attr)
         if df is None or df.empty:
             self.query_one("#fahdr", Static).update(Text(f"N/A — no fundamentals for {self.sec} (EDGAR or yfinance)", style=WARN))
             return
@@ -584,8 +546,7 @@ class ErnView(View):
         super().on_mount()
 
     async def load(self) -> None:
-        import yfinance as yf
-        ed = await self.hub.yf_call(f"ed:{self.sec}", 3600, lambda: yf.Ticker(self.sec).get_earnings_dates(limit=28))
+        ed = await self.hub.resource("yf", "earnings", symbol=self.sec)
         t = self.query_one("#eps", DataTable)
         t.clear(columns=True)
         t.add_columns("Date", "EPS est", "EPS act", "Surprise %")
@@ -637,11 +598,10 @@ class EvtsView(View):
         yield DataTable(cursor_type="row")
 
     async def load(self) -> None:
-        import yfinance as yf
         syms = [s for s in load_watchlist() if not any(c in s for c in "^=") and not s.endswith("-USD")]
 
         async def one(s):
-            cal = await self.hub.yf_call(f"cal:{s}", 3600, lambda: yf.Ticker(s).calendar)
+            cal = await self.hub.resource("yf", "calendar", symbol=s)
             d = (cal or {}).get("Earnings Date") if isinstance(cal, dict) else None
             d = d[0] if isinstance(d, (list, tuple)) and d else d
             return s, d, cal if isinstance(cal, dict) else {}

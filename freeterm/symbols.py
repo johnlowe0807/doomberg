@@ -38,7 +38,7 @@ Matching ignores case. Quote values containing spaces: _n="natural gas".
 /? oil _t=FUTURE _s=CL · /? _t=ETF _n=bond · /? apple _p=Yahoo
 /? AAPL _t=OPTION · /? AAPL 2026-12-18 _t=OPTION
 Option discovery is bounded to one underlying/expiry and 100 nearby contracts.
-Filter-only searches browse the local catalog; text searches also query Yahoo/EDGAR.
+Search reads the stored index; text searches refresh discovery from Yahoo/EDGAR.
 Results are limited to 100 matching securities. /?? displays this page.
 """
 
@@ -87,7 +87,7 @@ def parse_search(query):
 
 def catalog():
     # Reuse the boards so additions there automatically become searchable.
-    from .boards import BOARDS
+    from .catalog import BOARDS
     types = {"WEI": "INDEX", "CMDTY": "FUTURE", "CRYPTO": "CRYPTOCURRENCY",
              "FXL": "CURRENCY", "MOSTU": "EQUITY"}
     rows = [(s, n, types[k], "local") for k, entries in BOARDS.items() for s, n in entries]
@@ -136,105 +136,12 @@ def rank(query, symbol, name, kind=""):
 
 
 async def search_symbols(hub, query, aliases, publish=None):
-    from .fundamentals import edgar_tickers
-    import yfinance as yf
-
-    query, filters = parse_search(query)
-    wanted_type = filters.get("t")
-    from .options import contract, search as search_options
-    if wanted_type == "OPTION":
-        rows = await search_options(hub, query, aliases)
-        rows = [row for row in rows if matches_filters(row, filters, {"s": 0, "n": 1, "t": 2, "p": 3}, ("t", "p"))]
-        if publish:
-            publish(rows)
-        return rows
-
-    def allowed(row):
-        kind = "OPTION" if contract(row[0]) else canonical_type(row[2])
-        return kind != "OPTION"
-
-    rows = catalog()
-    names = {s: (n, ty) for s, n, ty, _ in rows}
-    for alias, symbol in aliases.items():
-        name, kind = names.get(symbol, (symbol, "SECURITY"))
-        rows.append((symbol, f"{name} ({alias})", kind, "alias"))
-
-    details = {}
-
-    def results(apply_filters=True):
-        # Match all names, then merge metadata by symbol. A better name must not
-        # change whether an alias or the original provider result matched.
-        grouped = {}
-        for row in rows:
-            grouped.setdefault(row[0].upper(), []).append(row)
-        ranked = []
-        for symbol, candidates in grouped.items():
-            score = min(rank(query, *r[:3]) for r in candidates)
-            if score == 99 and not any(r[3] == "Yahoo" for r in candidates):
-                continue
-            best = min(candidates, key=lambda r: (r[3] == "EDGAR", -len(r[1])))
-            name, kind, source = best[1:]
-            yahoo = next((r for r in candidates if r[3] == "Yahoo"), None)
-            if yahoo and yahoo[2] != "SECURITY":
-                kind = yahoo[2]
-            detail = details.get(symbol, {})
-            if detail.get("longName"):
-                name, source = detail["longName"], "Yahoo"
-            if detail.get("quoteType"):
-                kind = canonical_type(detail["quoteType"])
-            row = (symbol, name, kind, source)
-            if allowed(row) and (not apply_filters or matches_filters(row, filters, {"s": 0, "n": 1, "t": 2, "p": 3}, ("t", "p"))):
-                ranked.append((score, symbol, row))
-        return [row for _, _, row in sorted(ranked)[:100]]
-
+    from .query_models import SearchQuery
+    text, filters = parse_search(query)
+    request = SearchQuery('security', text, filters)
+    hub.queries.aliases = aliases
     if publish:
-        publish(results())
-
-    async def yahoo():
-        if not query:
-            return []
-        found = await hub.yf_call(f"asset-search:v2:{query.casefold()}", 600,
-            lambda: yf.Search(query, max_results=100, news_count=0, lists_count=0,
-                              enable_fuzzy_query=True, timeout=12).quotes)
-        for r in found or []:
-            if r.get("symbol"):
-                symbol = r["symbol"]
-                name = r.get("longname") or r.get("shortname") or symbol
-                kind = canonical_type(r.get("quoteType") or r.get("typeDisp") or "SECURITY")
-                # Yahoo may correct spelling: retain those provider-ranked matches too.
-                rows.append((symbol, name, kind, "Yahoo"))
-        return found or []
-
-    async def edgar():
-        if not query or (wanted_type and "EQUITY" not in wanted_type.split(',')):
-            return
-        tickers = await edgar_tickers(hub)
-        rows.extend((s, n, "EQUITY", "EDGAR") for s, (_, n) in tickers.items()
-                    if rank(query, s, n, "EQUITY") < 99)
-
-    async def guarded(fetch):
-        try:
-            await fetch()
-        except Exception as exc:
-            hub.warn(f"Search source unavailable: {type(exc).__name__}")
-        if publish:
-            publish(results())
-
-    await asyncio.gather(guarded(yahoo), guarded(edgar))
-    # One batched request, rather than one profile request per result. Search
-    # shortnames and EDGAR issuer names are often not instrument names.
-    symbols = [r[0] for r in results(False)]
-    if symbols:
-        def fetch_names():
-            from yfinance.data import YfData
-            response = YfData().get_raw_json(
-                "https://query1.finance.yahoo.com/v7/finance/quote",
-                params={"symbols": ",".join(sorted(symbols)), "formatted": "false"}, timeout=12)
-            return (response or {}).get("quoteResponse", {}).get("result", [])
-
-        try:
-            quotes = await hub.yf_call("search-names:v1:" + ",".join(sorted(symbols)), 86400, fetch_names)
-            details.update((r["symbol"].upper(), r) for r in quotes or [] if r.get("symbol"))
-        except Exception as exc:
-            hub.warn(f"Search names unavailable: {type(exc).__name__}")
-    return results()
+        initial = await hub.queries.query(request, stored_only=True)
+        publish(initial.data or [])
+    result = await hub.query(request)
+    return result.data or []

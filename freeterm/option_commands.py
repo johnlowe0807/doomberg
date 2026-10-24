@@ -162,8 +162,8 @@ def execute_one(view, verb, args):
         view.app.run_command(command)
     elif verb == 'REFRESH':
         if args: raise ValueError('REFRESH takes no arguments')
-        view.hub.mem._d.pop(f'exps:{view.sec}', None)
+        view.hub.invalidate_resource('yf', 'expiries', symbol=view.sec)
         expiry = view.loaded_expiry or view.current_expiry
         if expiry:
-            view.hub.mem._d.pop(f'chain:{view.sec}:{expiry}', None)
+            view.hub.invalidate_resource('yf', 'chain', symbol=view.sec, expiry=expiry)
         view.reload()

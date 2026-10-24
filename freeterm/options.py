@@ -36,7 +36,7 @@ def number(value):
         return None
 
 
-def remember_quote(hub, row):
+def remember_quote(hub, row, metadata=None):
     from .data import Quote
     symbol, last = row.get("contractSymbol"), number(row.get("lastPrice"))
     if not symbol or last is None or last < 0:
@@ -48,15 +48,17 @@ def remember_quote(hub, row):
     except (AttributeError, ValueError):
         stamp = None
     quote = Quote(symbol, price=last, prev_close=last - change if change is not None else None,
-                  volume=number(row.get("volume")), ts=stamp, fetched=time.time())
+                  volume=number(row.get("volume")), ts=stamp,
+                  fetched=(metadata or {}).get("fetched_at", time.time()),
+                  stale=(metadata or {}).get("freshness", "fresh") != "fresh")
     hub.last[symbol] = quote
-    hub.mem.put("q:" + symbol, quote, 30)
+    if not quote.stale:
+        hub.mem.put("q:" + symbol, quote, max(0, 30 - (time.time() - quote.fetched)))
+    return quote
 
 
 async def chain(hub, underlying, expiry):
-    import yfinance as yf
-    return await hub.yf_call(f"chain:{underlying}:{expiry}", 30,
-                             lambda: yf.Ticker(underlying).option_chain(expiry))
+    return await hub.resource("yf", "chain", symbol=underlying, expiry=expiry)
 
 
 async def snapshot(hub, symbol):
@@ -72,14 +74,15 @@ async def snapshot(hub, symbol):
         rows = frame[frame.contractSymbol == symbol]
         if not rows.empty:
             row = rows.iloc[0]
-            remember_quote(hub, row)
+            quote = remember_quote(hub, row, getattr(found, "freeterm", None))
+            if quote:
+                await hub.publish_quote(quote)
             return row
     return None
 
 
 async def search(hub, query, aliases):
     """Bound discovery to one underlying/expiry; no market-wide chain crawl."""
-    import yfinance as yf
     query = query.strip().upper()
     query = aliases.get(query, query)
     exact = contract(query)
@@ -94,14 +97,13 @@ async def search(hub, query, aliases):
     underlying = aliases.get(text, text)
     exps = None
     if re.fullmatch(r"[A-Z][A-Z0-9.\-]{0,11}", underlying):
-        exps = await hub.yf_call(f"exps:{underlying}", 300, lambda: yf.Ticker(underlying).options)
+        exps = await hub.resource("yf", "expiries", symbol=underlying)
     if not exps:
-        matches = await hub.yf_call(f"option-underlying:{text}", 600,
-            lambda: yf.Search(text, max_results=8, news_count=0, lists_count=0, timeout=12).quotes)
+        matches = await hub.resource("yf", "search", text=text, limit=8)
         underlying = next((item["symbol"] for item in matches or []
                            if item.get("quoteType") in ("EQUITY", "ETF") and item.get("symbol")), None)
         if underlying:
-            exps = await hub.yf_call(f"exps:{underlying}", 300, lambda: yf.Ticker(underlying).options)
+            exps = await hub.resource("yf", "expiries", symbol=underlying)
     if not exps:
         return []
     expiry = expiry or exps[0]
