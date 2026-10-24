@@ -1,0 +1,35 @@
+/* Phosphor palette. Single source of truth for colors. */
+Screen { background: #000000; color: #5FD7FF; }
+
+#top { height: 1; background: #000000; }
+#cmd { width: 1fr; height: 1; border: none; padding: 0 1; background: #000000; color: #FF5FD2; }
+#cmd:focus { border: none; background: #1a0016; }
+#mkt { width: auto; padding: 0 1; color: #FFD700; }
+#clock { width: auto; padding: 0 1; color: #FFFFFF; text-style: bold; }
+
+#panes { layout: grid; grid-size: 1 1; grid-gutter: 0; height: 1fr; }
+#panes.l2 { grid-size: 2 1; }
+#panes.l4 { grid-size: 2 2; }
+
+Pane { border: solid #3A6B80; height: 1fr; }
+Pane.active { border: solid #FF5FD2; }
+Pane.active .title { background: #FF5FD2; color: #000000; }
+Pane .title { height: 1; background: #0B3D91; color: #FFFFFF; text-style: bold; padding: 0 1; }
+Pane .body { height: 1fr; }
+#rangebar { height: 1; padding: 0 1; background: #000000; }
+Pane .msg { color: #FFD700; padding: 0 1; height: auto; }
+
+DataTable { background: #000000; color: #5FD7FF; height: 1fr; scrollbar-size: 1 1; }
+DataTable > .datatable--header { background: #0B3D91; color: #FFFFFF; text-style: bold; }
+DataTable > .datatable--cursor { background: #FF5FD2; color: #000000; }
+DataTable > .datatable--hover { background: #10202a; }
+
+#hints { height: 1; background: #0B3D91; color: #FFFFFF; padding: 0 1; }
+#status { height: 1; background: #000000; color: #3A6B80; padding: 0 1; }
+
+View Horizontal { height: 1fr; }
+View PlotextPlot { height: 1fr; }
+
+PromptScreen { align: center middle; background: #000000 60%; }
+PromptScreen > Vertical { width: 60; height: 5; border: solid #FF5FD2; background: #000000; }
+PromptScreen Input { border: none; height: 1; background: #1a0016; color: #FF5FD2; }
