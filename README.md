@@ -1,7 +1,6 @@
 # freeterm
 
-Keyboard-driven, phosphor-style terminal market monitor. Free data only (yfinance, FRED, Treasury, SEC EDGAR,
-Coinbase; Alpaca IEX optional). The full spec is in `CLAUDE.md`.
+vibe coded open-source finance data terminal
 
 ## Run
 ```
