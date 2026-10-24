@@ -10,6 +10,25 @@ import pandas as pd
 from .data import candle_interval
 
 
+@dataclass
+class BinarySearchCursor:
+    """Remember both search bounds; each direction keeps that half of the interval."""
+    lower: int
+    upper: int
+    position: int
+
+    def move(self, direction: int) -> int:
+        edge = self.lower if direction < 0 else self.upper
+        if edge == self.position:
+            return self.position
+        if direction < 0:
+            self.upper = self.position
+        else:
+            self.lower = self.position
+        self.position += direction * ((abs(edge - self.position) + 1) // 2)
+        return self.position
+
+
 @dataclass(frozen=True)
 class GotoTarget:
     offset: int | None = None

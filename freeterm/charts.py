@@ -80,6 +80,8 @@ class ChartView(View):
         self.original_security = self.sec
         self.price_type, self.price_volume = c.get("chart", "type", "candle"), bool(c.get("chart", "volume", True))
         self.pending_gotos = []
+        self._half_search = None
+        self._half_context = None
         self.cx: int | None = None
         self.zoom = (0.0, 1.0)
         self.df: pd.DataFrame | None = None
@@ -138,7 +140,7 @@ class ChartView(View):
         if self.graph_commands_enabled:
             self.hints = '. graph commands  ' + ('MODE scaling  ' if self.mode == 'comp' else '') + '1-9 range  '
             self.hints += '[ ] intvl  ' if self.uses_price_intervals else ''
-            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  Shift+←→ half jump  GOTO date/±n  +/- zoom  h/l pan  0 reset'
+            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  Shift+←→ binary search  GOTO date/±n  +/- zoom  h/l pan  0 reset'
             self.app.update_hints()
         on = "bold #000000 on #FF5FD2"
         t = Text()
@@ -239,6 +241,7 @@ class ChartView(View):
         if self.query_one(ChartSurface).size.width <= 0:   # not laid out yet (cache hit beat layout): retry
             self.call_after_refresh(self._refit)
             return
+        self._half_search = None
         self.auto_fit = True
         self.zoom = (0.0, 1.0)
 
@@ -284,6 +287,7 @@ class ChartView(View):
         return self.df.iloc[lo:hi]
 
     def select_point(self, position: int) -> None:
+        self._half_search = None
         n = len(self.df)
         position = max(0, min(n - 1, position))
         lo, hi = self.view_bounds()
@@ -313,13 +317,21 @@ class ChartView(View):
         lo, hi = self.view_bounds()
         count = hi - lo
         if not count:
+            self._half_search = None
             return
         current = max(0, min(count - 1, self.cx if self.cx is not None else count - 1))
         if half:
-            edge = 0 if direction < 0 else count - 1
-            current += direction * ((abs(edge - current) + 1) // 2)
-        elif self.cx is not None:
-            current += direction
+            from .chart_navigation import BinarySearchCursor
+            context = (self.sec, self.mode, self.rng, self.iv, lo, hi, self.df.index[lo], self.df.index[hi - 1])
+            search = self._half_search
+            if search is None or context != self._half_context or search.position != current:
+                search = BinarySearchCursor(0, count - 1, current)
+                self._half_search, self._half_context = search, context
+            current = search.move(direction)
+        else:
+            self._half_search = None
+            if self.cx is not None:
+                current += direction
         self.cx = max(0, min(count - 1, current))
         self.draw()
 
@@ -471,6 +483,7 @@ class ChartView(View):
             self.open_graph_commands()
         elif k and k in "123456789" and len(k) == 1:
             self.pending_gotos.clear()
+            self._half_search = None
             self.rng = RANGES[int(k) - 1]
             self.iv, self.zoom, self.cx, self.fit_pending = DEF_IV[self.rng], (0.0, 1.0), None, True
             self._fix_iv()
@@ -481,6 +494,7 @@ class ChartView(View):
             interval = step_interval(self.iv, 1 if k == "]" else -1)
             if self.hub.base_for(self.rng, interval) is not None:
                 self.pending_gotos.clear()
+                self._half_search = None
                 self.iv, self.zoom, self.cx, self.fit_pending = interval, (0.0, 1.0), None, True
                 self.render_rangebar()
                 self.retitle()
@@ -498,9 +512,11 @@ class ChartView(View):
             self.move_crosshair(1 if k.endswith("right") else -1, half=k.startswith("shift+"))
         elif k == "x":
             self.pending_gotos.clear()
+            self._half_search = None
             self.cx = None
             self.draw()
         elif k in ("+", "-", "=") and self.df is not None and len(self.df):
+            self._half_search = None
             a, b = self.zoom
             self.auto_fit = False
             n = len(self.df)
@@ -517,6 +533,7 @@ class ChartView(View):
                 self.cx = selected - int(a * n)
             self.draw()
         elif k in ("h", "l"):
+            self._half_search = None
             self.auto_fit = False
             a, b = self.zoom
             d = (b - a) * 0.2 * (1 if k == "l" else -1)
@@ -525,6 +542,7 @@ class ChartView(View):
             self.draw()
         elif k == "0":
             self.pending_gotos.clear()
+            self._half_search = None
             self.cx = None
             self.fit_view()
             self.draw()

@@ -83,7 +83,10 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
   `AAPL .TIME 1Y .SIZE 2wk` opens AAPL first, then applies both commands in order.
   `AAPL /GP .IND BB` opens a specific view with an indicator; `.IND BB` alone edits the current graph.
   Legacy slash graph commands remain accepted.
-- On a graph, Shift+Left/Right moves the selection halfway toward that visible edge, rounding toward the edge.
+- On a graph, Shift+Left/Right performs binary search within the visible candles. Each jump moves halfway toward
+  the chosen bound and remembers the previous cursor as the opposite bound. Reversing direction therefore narrows
+  between earlier pivots rather than jumping back toward the wall. For positions 0–100: `100 → Left 50 → Right 75 → Left 62`.
+  Rounding favors the chosen bound. Plain arrows, GOTO, and zoom/pan/range changes start a fresh search; `x`/`0` clears it.
   Plain arrows still step one datapoint. `GOTO 20261023 1030` or `GOTO 2026-10-23T10:30` selects the containing candle;
   `GOTO LEFT 50`, `GOTO RIGHT 25`, `GOTO -50` and `GOTO +25` shift by active candles.
   Use these in the `.` popup, or `.GOTO ...` on the main line. Without a selection, offsets start at the visible
