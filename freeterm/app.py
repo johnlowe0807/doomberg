@@ -1,7 +1,7 @@
 """Textual app: command bar, tiled panes, views. Phase 1 skeleton.
 
 To add a function: subclass View, set FUNC/title/hints, implement `load()` (async, fetch via
-self.hub) and optionally `key_*` handlers; register it in VIEWS. See HANDOFF.md.
+self.hub) and optionally `key_*` handlers; register it in VIEWS. See docs/HANDOFF.md.
 """
 from __future__ import annotations
 
@@ -177,7 +177,7 @@ class View(Vertical):
 class StubView(View):
     def compose(self) -> ComposeResult:
         yield Static(f"{self.FUNC} is not built yet (phase {FUNCS.get(self.FUNC, '?')}). "
-                     "See HANDOFF.md.", classes="msg")
+                     "See docs/HANDOFF.md.", classes="msg")
 
 
 class QuoteView(View):

@@ -7,4 +7,4 @@ __pycache__/
 .env
 .env.*
 !.env.example
-/docs/llm-instruction/
+/docs/claude-prompts/
