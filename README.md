@@ -62,6 +62,9 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
   In `[chart]`, `renderer = "auto"` can be overridden with `"text"`, `"sixel"`, or `"tgp"` (restart to apply).
   `font_px = 0` follows terminal cell height; a positive value sets the raster label size.
   `font_path` can point to your terminal font file (macOS defaults to Menlo); text charts use the terminal font.
+  With `font_px = 0`, raster labels match the terminal’s reported character-cell size and follow font/viewport changes.
+  Positive `font_px` values explicitly override auto sizing; `font_path` matches the font face when needed.
+  Stacked scales retain readable label sizes; a pane too small to fit them asks to be enlarged.
   Axis numbers use the brighter foreground color. Candle width fits the complete selected range by default;
   zoom never combines candles. The quote header shows the return over that selected range.
 - Press `.` on a graph for its command popup. Enter commands directly, without `/`; `HELP` or `?` opens the command
@@ -80,6 +83,12 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
   `AAPL .TIME 1Y .SIZE 2wk` opens AAPL first, then applies both commands in order.
   `AAPL /GP .IND BB` opens a specific view with an indicator; `.IND BB` alone edits the current graph.
   Legacy slash graph commands remain accepted.
+- On a graph, Ctrl+Left/Right moves the selection halfway toward that visible edge, rounding toward the edge.
+  Plain arrows still step one datapoint. `GOTO 20261023 1030` or `GOTO 2026-10-23T10:30` selects the containing candle;
+  `GOTO LEFT 50`, `GOTO RIGHT 25`, `GOTO -50` and `GOTO +25` shift by active candles.
+  Use these in the `.` popup, or `.GOTO ...` on the main line. Without a selection, offsets start at the visible
+  rightmost candle. Dates use New York time unless an explicit offset/Z is supplied; gaps use the previous observed
+  point and out-of-range dates fail. Off-screen targets pan into view while preserving zoom; counts clamp at data edges.
 - In the popup, `TIME 2Y` or `TIME 18M 1d` sets a custom complete time window, using cached history and provider limits.
   `SIZE 2d`, `SIZE 2 weeks`, or `SIZE 0.5 years` sets each candle/data point interval while preserving the window.
   Fixed durations span 1 minute–366 days in whole minutes; calendar durations span 1–12 whole months (`0.5y` = `6mo`).

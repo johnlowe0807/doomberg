@@ -79,6 +79,20 @@ def font(size: int, path: str = ""):
     return ImageFont.load_default(size=size)
 
 
+@lru_cache(maxsize=128)
+def matched_font_size(width: int, height: int, path: str = "") -> int:
+    """Match a raster monospace advance to one reported terminal character cell."""
+    reference = font(32, path)
+    size = max(8, min(512, height * 2, round(width * 32 / max(1, reference.getlength("0")))))
+    while size > 8:
+        face = font(size, path)
+        box = face.getbbox("0123456789Ag")
+        if face.getlength("0") <= width * 1.05 and box[3] - box[1] <= height * .95:
+            break
+        size -= 1
+    return size
+
+
 def number(v: float) -> str:
     a = abs(v)
     if a >= 1e9:
@@ -314,6 +328,23 @@ def render_stacked_text(plot: PlotextPlot, scene: Scene) -> Text:
     return result
 
 
+def date_labels(dates, xs, left, right, draw, face, padding):
+    """Keep endpoint labels on canvas without colliding with adjacent labels."""
+    for count in range(min(6, len(dates)), 0, -1):
+        labels, previous_end = [], None
+        for index in np.unique(np.linspace(0, len(dates) - 1, count, dtype=int)):
+            label = dates[index]
+            width = draw.textlength(label, font=face)
+            x = max(left, min(right - width, left + xs[index] - width / 2))
+            if previous_end is not None and x < previous_end + padding:
+                break
+            labels.append((label, x))
+            previous_end = x + width
+        else:
+            return labels
+    return []
+
+
 def render_stacked_pixels(scene: Scene, size: tuple[int, int]) -> Image.Image:
     """One independent, color-matched scale column per series, all left of the shared canvas."""
     width, height = (max(1, int(value)) for value in size)
@@ -322,14 +353,10 @@ def render_stacked_pixels(scene: Scene, size: tuple[int, int]) -> Image.Image:
     draw = ImageDraw.Draw(canvas)
     scales = independent_scales(scene.panels[0], 6 if height >= 180 else 3)
     size_px = max(8, scene.font_size)
-    while True:
-        ft = font(size_px * scale, scene.font_path)
-        widths = [max(draw.textlength(label, font=ft) for label in [f'[{i}]', *labels]) + 14 * scale
-                  for i, (_, _, labels) in enumerate(scales, 1)]
-        left = int(sum(widths) + 6 * scale)
-        if left + 100 * scale <= width * scale or size_px <= 8:
-            break
-        size_px -= 1
+    ft = font(size_px * scale, scene.font_path)
+    widths = [max(draw.textlength(label, font=ft) for label in [f'[{i}]', *labels]) + 14 * scale
+              for i, (_, _, labels) in enumerate(scales, 1)]
+    left = int(sum(widths) + 6 * scale)
     right = (width - 12) * scale
     pw = right - left
     line_h = (size_px + 5) * scale
@@ -393,11 +420,7 @@ def render_stacked_pixels(scene: Scene, size: tuple[int, int]) -> Image.Image:
         td.line((xx, 0, xx, gh - 1), fill=MAGENTA, width=scale)
     canvas.paste(tile, (left, top))
     draw.line((left, bottom, right, bottom), fill=DIM, width=scale)
-    label_width = max(draw.textlength(label, font=ft) for label in scene.dates)
-    count = max(1, min(6, int(pw / (label_width + 16 * scale))))
-    for i in np.unique(np.linspace(0, n - 1, count, dtype=int)):
-        label = scene.dates[i]
-        xx = min(right - draw.textlength(label, font=ft), max(left, left + xs[i] - draw.textlength(label, font=ft) / 2))
+    for label, xx in date_labels(scene.dates, xs, left, right, draw, ft, 16 * scale):
         draw.text((xx, bottom + 4 * scale), label, fill=FG, font=ft)
     return canvas.resize((width, height), Image.Resampling.LANCZOS)
 
@@ -565,13 +588,7 @@ def render_chart(scene: Scene, size: tuple[int, int]) -> Image.Image:
             xx += tw + 14 * scale
         top = bottom + gap
     # One shared date axis; reserve enough pixel width to avoid overlapping dates.
-    label_width = max(d.textlength(s, font=ft) for s in scene.dates)
-    count = max(1, min(6, int(pw / (label_width + 16 * scale))))
-    indices = np.unique(np.linspace(0, n - 1, count, dtype=int))
-    for i in indices:
-        label = scene.dates[i]
-        tw = d.textlength(label, font=ft)
-        xx = min(right - tw, max(left, left + xs[i] - tw / 2))
+    for label, xx in date_labels(scene.dates, xs, left, right, d, ft, 16 * scale):
         d.text((xx, height * scale - footer + 4 * scale), label, fill=FG, font=ft)
     return canvas.resize(size, Image.Resampling.LANCZOS)
 
@@ -730,10 +747,12 @@ class ChartSurface(Container):
 
     def submit(self, scene: Scene) -> None:
         configured = int(self.app.cfg.get("chart", "font_px", 0))
-        # Text fallback already uses the terminal font. Match raster labels to its physical cell height.
-        height = self.pixel_size()[1] / max(1, self.size.height) if self.pixels else 16
-        scene = replace(scene, font_size=max(8, min(48, configured or round(height * .8))),
-                        font_path=str(self.app.cfg.get("chart", "font_path", "")))
+        # Text fallback uses the terminal font. Match raster glyph advances to reported cell geometry.
+        size = self.pixel_size() if self.pixels else (max(1, self.size.width) * 8, max(1, self.size.height) * 16)
+        width, height = size[0] // max(1, self.size.width), size[1] // max(1, self.size.height)
+        path = str(self.app.cfg.get("chart", "font_path", ""))
+        scene = replace(scene, font_size=max(8, min(512, configured)) if configured > 0 else matched_font_size(width, height, path),
+                        font_path=path)
         self.scene = scene
         if not self.pixels:
             render_text(scene, self.query_one(PlotextPlot))

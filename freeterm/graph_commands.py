@@ -11,7 +11,7 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
-VERBS = ("IND", "CMP", "MODE", "IEX", "TIME", "SIZE", "TF", "DES", "CHAIN")
+VERBS = ("IND", "CMP", "MODE", "IEX", "TIME", "SIZE", "TF", "GOTO", "DES", "CHAIN")
 INDICATORS = {"SMA": ("s", "sma"), "EMA": ("e", "ema"), "BB": ("b", "bb"),
               "VWAP": ("w", None), "RSI": ("r", "rsi"), "MACD": ("m", "macd"),
               "VOLUME": ("v", None), "IEX": ("i", None)}
@@ -32,6 +32,7 @@ HELP = (
     "Intervals: 1 minute–366 days or 1–12 calendar months; source history limits also apply.\n"
     "Chain in order: TIME 2Y SIZE 2d IND VWAP RSI. Errors stop the chain after earlier changes.\n"
     "Main line: AAPL .TIME 1Y .SIZE 2wk opens the view first; .IND BB edits the active graph.\n"
+    "GOTO YYYYMMDD [HHMM] · GOTO LEFT 50 · GOTO +25 · Ctrl+arrows jump halfway to the visible edge.\n"
     "HELP or ? lists commands. The popup accepts bare or .prefixed commands."
 )
 
@@ -43,9 +44,9 @@ def available_verbs(chart):
     if not chart.graph_commands_enabled:
         return ()
     if chart.mode == "series":
-        return ("CMP", "TIME", "TF", "DES")
+        return ("CMP", "TIME", "TF", "GOTO", "DES")
     if chart.mode == "comp":
-        return ("CMP", "MODE", "TIME", "TF") + (("SIZE",) if chart.uses_price_intervals else ())
+        return ("CMP", "MODE", "TIME", "TF", "GOTO") + (("SIZE",) if chart.uses_price_intervals else ())
     from .live import is_us_equity
     from .options import contract
     return tuple(verb for verb in VERBS if verb != 'MODE' and (verb != 'CHAIN' or contract(chart.sec)) and (verb != "IEX" or is_us_equity(chart.sec)))
@@ -77,6 +78,11 @@ def graph_help(chart):
               "ISO dates/timestamps also work: TF 2024-01-01 2024-06-30.",
               "Times: New York. Date-only ends include that day; timestamp ends are exclusive.",
               "Lengths: min/m minutes, h hours, D days, W weeks, M/mo months, Y years."]
+    lines += ["GOTO 20261023 1030 · GOTO 2026-10-23T10:30 · GOTO LEFT 50 · GOTO RIGHT 25",
+              "GOTO -50 / +25 shifts by loaded candles; default selection is the visible rightmost point.",
+              "Datetimes use New York time unless an offset/Z is supplied; dates select the containing candle.",
+              "Gaps select the previous observation; out-of-range dates fail. Off-screen selections pan into view.",
+              "←/→ steps one point; Ctrl+←/→ jumps halfway toward the visible edge (rounded toward the edge)."]
     if chart.mode == "px":
         aliases = "; ".join(f"{alias}={name}" for alias, name in INDICATOR_ALIASES.items() if name in available_indicators(chart))
         lines += ["IND " + " ".join(available_indicators(chart)) + " [ON|OFF] · IND CLEAR",
@@ -274,6 +280,7 @@ def execute_one(chart, line):
             chart.mode, chart.ctype, chart.vol = "comp", "line", False
         chart.df = None
         chart.raw_comparison = None
+        chart.pending_gotos.clear()
         chart.zoom, chart.cx, chart.fit_pending = (0., 1.), None, True
         chart.render_rangebar()
         chart.retitle()
@@ -288,6 +295,7 @@ def execute_one(chart, line):
         if selected_mode == 'STACKED' and raw is not None and len(raw.columns) != len(chart.compare_refs):
             raise ValueError('STACKED needs data for every selected series')
         chart.compare_mode = selected_mode
+        chart.pending_gotos.clear()
         chart.zoom, chart.cx, chart.fit_pending = (0., 1.), None, True
         if frame is not None:
             chart.df = frame.copy(); chart.fit_view(); chart.draw()
@@ -302,6 +310,9 @@ def execute_one(chart, line):
         if args:
             raise ValueError('CHAIN takes no arguments')
         chart.app.run_command('/OMON ' + chart.sec)
+    elif verb == "GOTO":
+        from .chart_navigation import parse_goto
+        chart.goto(parse_goto(args))
     elif verb in ("TIME", "TF"):
         if verb == "TF":
             args = [parse_timeframe(args)]
@@ -323,6 +334,7 @@ def execute_one(chart, line):
         chart.rng, chart.iv = rng, interval
         chart.df = None
         chart.raw_comparison = None
+        chart.pending_gotos.clear()
         chart.zoom, chart.cx, chart.fit_pending = (0., 1.), None, True
         chart.render_rangebar()
         chart.retitle()
@@ -338,6 +350,7 @@ def execute_one(chart, line):
         chart.iv = interval
         chart.df = None
         chart.raw_comparison = None
+        chart.pending_gotos.clear()
         chart.zoom, chart.cx, chart.fit_pending = (0., 1.), None, True
         chart.render_rangebar()
         chart.retitle()
@@ -432,6 +445,8 @@ class GraphCommandScreen(ModalScreen):
                       'EXPIRY': ['NEXT', 'PREV', 'FIRST', 'LAST', 'LIST', *self.chart.expiries],
                       'SIDE': ['CALL', 'PUT'], 'STRIKE': ['ATM', 'NEXT', 'PREV'], 'HIST': RANGES, 'GRAPH': RANGES}
             choices = [stem_prefix + word for word in values.get(current, [])] + choices
+        elif current == 'GOTO':
+            choices = [stem_prefix + word for word in ('LEFT', 'RIGHT', '+10', '-10')] + choices
         elif current == 'MODE':
             from .comparison import MODES
             choices = [stem_prefix + word for word in MODES] + choices

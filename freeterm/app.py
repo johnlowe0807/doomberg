@@ -34,7 +34,7 @@ FUNCS = {
     "COMP": 8, "WEI": 3, "MOST": 3, "CMDTY": 3, "FXC": 3, "CRYPTO": 3, "TOP": 5, "OMON": 5,
     "GC": 4, "BTMM": 4, "SPRD": 4, "AUCT": 4, "FRED": 4, "FA": 6, "ERN": 6, "FIL": 6,
     "EVTS": 6, "IEX": 7, "LAYOUT": 1, "?": 8, "DAT": 5, "BOOK": 5,
-    "IND": 8, "CMP": 8, "MODE": 8, "TIME": 8, "SIZE": 8, "TF": 8, "??": 8, "FRED?": 4, "FRED??": 4,
+    "IND": 8, "CMP": 8, "MODE": 8, "TIME": 8, "SIZE": 8, "TF": 8, "GOTO": 8, "??": 8, "FRED?": 4, "FRED??": 4,
 }
 SEC_FUNCS = {"Q", "DES", "FREDDES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL", "DAT", "BOOK"}
 SUFFIXES = {"US", "EQUITY", "INDEX", "CURNCY", "COMDTY", "GOVT"}
@@ -319,7 +319,7 @@ FUNC_HELP = [
     ("GIP", "intraday graph"), ("HP", "historical prices table"), ("CN", "company news"),
     ("DAT [SEC] [range]", "selected-range statistics; inherits the active chart range/interval"),
     ("BOOK [SEC]", "available order book: Coinbase depth or Yahoo best bid/ask"),
-    ("IND/CMP/TIME/SIZE/TF", "active graph commands; '.' opens the graph command popup"),
+    ("IND/CMP/TIME/SIZE/TF/GOTO", "active graph commands; '.' opens the graph command popup"),
     ("COMP A B [_fred=ID]", "mixed-source comparison; _mode=NORMALIZED|REAL|STACKED"),
     ("OMON", "option monitor; dot commands: EXP/SIDE/STRIKE/WIDTH/OPEN/HIST/BOOK"), ("FA", "financial statements (EDGAR XBRL)"), ("FIL", "SEC filings + reader"),
     ("ERN", "earnings history + 8-K releases"), ("MON", "watchlist"), ("EVTS", "watchlist earnings calendar"),
@@ -341,9 +341,9 @@ def help_text() -> str:
         "Options: /? AAPL _t=OPTIONS [YYYY-MM-DD] searches one expiry (nearest by default). Options are hidden in other searches.\n"
         "Tab/Shift+Tab pane focus · Ctrl+1/2/4 or /LAYOUT n · Ctrl+W close pane · Ctrl+R refresh · ? help · Ctrl+Q quit (confirm)\n\n"
         f"{funcs}\n\n"
-        "Charts: 1-9 range  [ ] interval  t type  o log  ←→ crosshair  x hide  +/- zoom  h/l pan  0 reset\n"
+        "Charts: 1-9 range  [ ] interval  t type  o log  ←→ crosshair  Ctrl+←→ half jump  x hide  +/- zoom  h/l pan  0 reset\n"
         "Graph commands: '.' popup · .IND VOLUME VWAP RSI MACD · .IND RSI MACD _p=14;12,26,9 · .CMP AAPL AMZN · .IEX ON\n"
-        "                .TIME 2Y [1d] · .SIZE 2d or 0.5y · .TF 20240101 3M · .SIZE RESET\n"
+        "                .TIME 2Y [1d] · .SIZE 2d or 0.5y · .TF 20240101 3M · .SIZE RESET · .GOTO 20261023 1030 / LEFT 50 / +25\n"
         "Graph HELP lists commands for its type. HOME preview is fixed at 1D/5m.\n"
         "Source tags: LIVE = stream · DLY = polled/unofficial (yfinance) · STALE = expired fallback / older than 5 min\n"
         "Aliases: ~/.freeterm/aliases.toml   Settings: ~/.freeterm/config.toml")
@@ -626,7 +626,7 @@ class FreeTerm(App):
                 args = [arg for arg in args if not arg.startswith(('_FRED=', '_T='))]
                 sid = explicit or sec or (args.pop(0) if args else (getattr(pane.view, 'series', []) or [pane.view.sec])[0])
                 func, sec, args = 'FREDDES', sid, []
-        if func in ("IND", "CMP", "MODE", "TIME", "SIZE", "TF"):
+        if func in ("IND", "CMP", "MODE", "TIME", "SIZE", "TF", "GOTO"):
             graph = self.active_command_target(pane)
             if graph is None:
                 self.hub.warn("Open a security graph before using graph commands")

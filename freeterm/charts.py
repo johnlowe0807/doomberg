@@ -79,6 +79,7 @@ class ChartView(View):
         self.raw_comparison = None
         self.original_security = self.sec
         self.price_type, self.price_volume = c.get("chart", "type", "candle"), bool(c.get("chart", "volume", True))
+        self.pending_gotos = []
         self.cx: int | None = None
         self.zoom = (0.0, 1.0)
         self.df: pd.DataFrame | None = None
@@ -137,7 +138,7 @@ class ChartView(View):
         if self.graph_commands_enabled:
             self.hints = '. graph commands  ' + ('MODE scaling  ' if self.mode == 'comp' else '') + '1-9 range  '
             self.hints += '[ ] intvl  ' if self.uses_price_intervals else ''
-            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  +/- zoom  h/l pan  0 reset'
+            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  Ctrl+←→ half jump  GOTO date/±n  +/- zoom  h/l pan  0 reset'
             self.app.update_hints()
         on = "bold #000000 on #FF5FD2"
         t = Text()
@@ -193,6 +194,13 @@ class ChartView(View):
             if self.fit_pending:
                 self.fit_pending = False
                 self.fit_view()
+        pending, self.pending_gotos = self.pending_gotos, []
+        for target in pending:
+            try:
+                self.goto(target, redraw=False)
+            except ValueError as error:
+                self.hub.warn(str(error))
+                break
         self.draw()
         if self.prefetch_enabled and not self.prefetched and self.mode != "series" and self.sec and not contract(self.sec):
             # after first paint: download the other bases so every range/interval flip is local and instant
@@ -263,10 +271,57 @@ class ChartView(View):
             self.hub.warn(f"pixel chart unavailable; using text: {event.reason}"[:120])
             self.call_after_refresh(self._refit)
 
+    def view_bounds(self) -> tuple[int, int]:
+        n = len(self.df) if self.df is not None else 0
+        if not n:
+            return 0, 0
+        lo = max(0, min(n - 1, int(self.zoom[0] * n + 1e-9)))
+        hi = min(n, max(lo + 2, int(self.zoom[1] * n + 1e-9)))
+        return lo, hi
+
     def view_df(self) -> pd.DataFrame:
-        n = len(self.df)
-        lo, hi = int(self.zoom[0] * n), max(int(self.zoom[1] * n), int(self.zoom[0] * n) + 2)
+        lo, hi = self.view_bounds()
         return self.df.iloc[lo:hi]
+
+    def select_point(self, position: int) -> None:
+        n = len(self.df)
+        position = max(0, min(n - 1, position))
+        lo, hi = self.view_bounds()
+        if not lo <= position < hi:
+            count = hi - lo
+            lo = max(0, min(n - count, position - count // 2))
+            self.zoom = (lo / n, (lo + count) / n)
+            self.auto_fit = False
+        self.cx = position - lo
+
+    def goto(self, target, *, redraw=True) -> None:
+        if self.df is None:
+            self.pending_gotos.append(target)
+            return
+        if not len(self.df):
+            raise ValueError('GOTO needs loaded datapoints')
+        from .chart_navigation import locate
+        lo, hi = self.view_bounds()
+        selected = lo + self.cx if self.cx is not None else hi - 1
+        position = selected + target.offset if target.offset is not None else locate(
+            self.df.index, target.timestamp, self.iv, self.mode == 'px')
+        self.select_point(position)
+        if redraw:
+            self.draw()
+
+    def move_crosshair(self, direction: int, *, half=False) -> None:
+        lo, hi = self.view_bounds()
+        count = hi - lo
+        if not count:
+            return
+        current = max(0, min(count - 1, self.cx if self.cx is not None else count - 1))
+        if half:
+            edge = 0 if direction < 0 else count - 1
+            current += direction * ((abs(edge - current) + 1) // 2)
+        elif self.cx is not None:
+            current += direction
+        self.cx = max(0, min(count - 1, current))
+        self.draw()
 
     def draw(self) -> None:
         if self.df is None or self.df.empty:
@@ -415,6 +470,7 @@ class ChartView(View):
         if k == ".":
             self.open_graph_commands()
         elif k and k in "123456789" and len(k) == 1:
+            self.pending_gotos.clear()
             self.rng = RANGES[int(k) - 1]
             self.iv, self.zoom, self.cx, self.fit_pending = DEF_IV[self.rng], (0.0, 1.0), None, True
             self._fix_iv()
@@ -424,6 +480,7 @@ class ChartView(View):
         elif k in ("[", "]") and self.uses_price_intervals:
             interval = step_interval(self.iv, 1 if k == "]" else -1)
             if self.hub.base_for(self.rng, interval) is not None:
+                self.pending_gotos.clear()
                 self.iv, self.zoom, self.cx, self.fit_pending = interval, (0.0, 1.0), None, True
                 self.render_rangebar()
                 self.retitle()
@@ -437,11 +494,10 @@ class ChartView(View):
         elif k == "o" and self.mode == "px":
             self.logy = not self.logy
             self.draw()
-        elif k in ("left", "right"):
-            n = len(self.view_df()) if self.df is not None else 0
-            self.cx = (n - 1 if self.cx is None else self.cx + (1 if k == "right" else -1))
-            self.draw()
+        elif k in ("left", "right", "ctrl+left", "ctrl+right"):
+            self.move_crosshair(1 if k.endswith("right") else -1, half=k.startswith("ctrl+"))
         elif k == "x":
+            self.pending_gotos.clear()
             self.cx = None
             self.draw()
         elif k in ("+", "-", "=") and self.df is not None and len(self.df):
@@ -468,6 +524,7 @@ class ChartView(View):
             self.zoom = (a + d, b + d)
             self.draw()
         elif k == "0":
+            self.pending_gotos.clear()
             self.cx = None
             self.fit_view()
             self.draw()
