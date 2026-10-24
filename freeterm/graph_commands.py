@@ -32,7 +32,7 @@ HELP = (
     "Intervals: 1 minute–366 days or 1–12 calendar months; source history limits also apply.\n"
     "Chain in order: TIME 2Y SIZE 2d IND VWAP RSI. Errors stop the chain after earlier changes.\n"
     "Main line: AAPL .TIME 1Y .SIZE 2wk opens the view first; .IND BB edits the active graph.\n"
-    "GOTO YYYYMMDD [HHMM] · GOTO LEFT 50 · GOTO +25 · Ctrl+arrows jump halfway to the visible edge.\n"
+    "GOTO YYYYMMDD [HHMM] · GOTO LEFT 50 · GOTO +25 · Shift+arrows jump halfway to the visible edge.\n"
     "HELP or ? lists commands. The popup accepts bare or .prefixed commands."
 )
 
@@ -82,7 +82,7 @@ def graph_help(chart):
               "GOTO -50 / +25 shifts by loaded candles; default selection is the visible rightmost point.",
               "Datetimes use New York time unless an offset/Z is supplied; dates select the containing candle.",
               "Gaps select the previous observation; out-of-range dates fail. Off-screen selections pan into view.",
-              "←/→ steps one point; Ctrl+←/→ jumps halfway toward the visible edge (rounded toward the edge)."]
+              "←/→ steps one point; Shift+←/→ jumps halfway toward the visible edge (rounded toward the edge)."]
     if chart.mode == "px":
         aliases = "; ".join(f"{alias}={name}" for alias, name in INDICATOR_ALIASES.items() if name in available_indicators(chart))
         lines += ["IND " + " ".join(available_indicators(chart)) + " [ON|OFF] · IND CLEAR",

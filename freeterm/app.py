@@ -341,7 +341,7 @@ def help_text() -> str:
         "Options: /? AAPL _t=OPTIONS [YYYY-MM-DD] searches one expiry (nearest by default). Options are hidden in other searches.\n"
         "Tab/Shift+Tab pane focus · Ctrl+1/2/4 or /LAYOUT n · Ctrl+W close pane · Ctrl+R refresh · ? help · Ctrl+Q quit (confirm)\n\n"
         f"{funcs}\n\n"
-        "Charts: 1-9 range  [ ] interval  t type  o log  ←→ crosshair  Ctrl+←→ half jump  x hide  +/- zoom  h/l pan  0 reset\n"
+        "Charts: 1-9 range  [ ] interval  t type  o log  ←→ crosshair  Shift+←→ half jump  x hide  +/- zoom  h/l pan  0 reset\n"
         "Graph commands: '.' popup · .IND VOLUME VWAP RSI MACD · .IND RSI MACD _p=14;12,26,9 · .CMP AAPL AMZN · .IEX ON\n"
         "                .TIME 2Y [1d] · .SIZE 2d or 0.5y · .TF 20240101 3M · .SIZE RESET · .GOTO 20261023 1030 / LEFT 50 / +25\n"
         "Graph HELP lists commands for its type. HOME preview is fixed at 1D/5m.\n"

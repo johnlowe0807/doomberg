@@ -138,7 +138,7 @@ class ChartView(View):
         if self.graph_commands_enabled:
             self.hints = '. graph commands  ' + ('MODE scaling  ' if self.mode == 'comp' else '') + '1-9 range  '
             self.hints += '[ ] intvl  ' if self.uses_price_intervals else ''
-            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  Ctrl+←→ half jump  GOTO date/±n  +/- zoom  h/l pan  0 reset'
+            self.hints += ('t type  o log  ' if self.mode == 'px' else 't line/area  ') + '←→ xhair  Shift+←→ half jump  GOTO date/±n  +/- zoom  h/l pan  0 reset'
             self.app.update_hints()
         on = "bold #000000 on #FF5FD2"
         t = Text()
@@ -494,8 +494,8 @@ class ChartView(View):
         elif k == "o" and self.mode == "px":
             self.logy = not self.logy
             self.draw()
-        elif k in ("left", "right", "ctrl+left", "ctrl+right"):
-            self.move_crosshair(1 if k.endswith("right") else -1, half=k.startswith("ctrl+"))
+        elif k in ("left", "right", "shift+left", "shift+right"):
+            self.move_crosshair(1 if k.endswith("right") else -1, half=k.startswith("shift+"))
         elif k == "x":
             self.pending_gotos.clear()
             self.cx = None
