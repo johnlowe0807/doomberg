@@ -16,6 +16,7 @@ from .app import DIM, UP, DOWN, WARN, VIEWS, View, fbig, fnum, colored, tag_text
 from .app import regular_hours
 from .data import IVS, RANGE_DAYS, RANGES, DiskCache, RateLimiter
 from .live import age, iex_eval
+from .pixelcharts import ChartSurface, GraphicsFailed, PixelSizeChanged, Panel, Scene, Trace
 
 PERIOD = {"1D": "1d", "5D": "5d", "1M": "1mo", "3M": "3mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y", "MAX": "max"}
 DEF_IV = {"1D": "5m", "5D": "15m", "1M": "1h", "3M": "1d", "6M": "1d", "YTD": "1d", "1Y": "1d", "5Y": "1wk", "MAX": "1wk"}
@@ -92,7 +93,7 @@ class ChartView(View):
     def compose(self) -> ComposeResult:
         yield Static("", classes="msg", id="info")
         yield Static("", id="rangebar")
-        yield PlotextPlot(id="plot")
+        yield ChartSurface(self.app.cfg.get("chart", "renderer", "auto"), id="chart")
 
     def on_mount(self) -> None:
         c = self.app.cfg
@@ -201,33 +202,45 @@ class ChartView(View):
     def info(self, msg) -> None:
         self.query_one("#info", Static).update(msg if isinstance(msg, Text) else Text(str(msg), style=WARN))
 
-    def chart_cols(self) -> int:
-        """Columns available for bars (plot width minus y-axis labels and frame)."""
-        return max(10, self.query_one(PlotextPlot).size.width - 12)
+    def chart_font(self) -> int:
+        return max(8, min(24, int(self.app.cfg.get("chart", "font_px", 12))))
 
     def fit_view(self) -> None:
-        """Candles/OHLC are never combined: if the native bars don't fit at candle_cols columns each, show the most
-        recent ones that do (pan with h/l for the rest). Lines/areas can always show everything."""
-        n = len(self.df) if self.df is not None else 0
-        if self.query_one(PlotextPlot).size.width <= 0:   # not laid out yet (cache hit beat layout): retry
+        """Fit the complete selected range; geometry scales native candles to the viewport."""
+        if self.query_one(ChartSurface).size.width <= 0:   # not laid out yet (cache hit beat layout): retry
             self.call_after_refresh(self._refit)
             return
         self.auto_fit = True
-        fit = self.chart_cols() // max(1, int(self.app.cfg.get("chart", "candle_cols", 2)))
-        if self.mode == "px" and self.ctype in ("candle", "ohlc") and n > fit:
-            self.zoom = (1.0 - fit / n, 1.0)
-        else:
-            self.zoom = (0.0, 1.0)
+        self.zoom = (0.0, 1.0)
 
     def _refit(self) -> None:
-        if self.df is not None:
+        if self.is_mounted and self.query(ChartSurface) and self.df is not None:
             self.fit_view()
             self.draw()
 
     def on_resize(self) -> None:
-        if getattr(self, "auto_fit", False) and self.df is not None:
+        if getattr(self, "df", None) is not None:
+            self.call_after_refresh(self._resize_chart)
+
+    def _resize_chart(self) -> None:
+        if not self.is_mounted or not self.query(ChartSurface):
+            return
+        if getattr(self, "auto_fit", False):
             self.fit_view()
-            self.draw()
+        self.draw()
+
+    def on_pixel_size_changed(self, event: PixelSizeChanged) -> None:
+        event.stop()
+        if getattr(self, "df", None) is not None:
+            self.call_after_refresh(self._resize_chart)
+
+    def on_graphics_failed(self, event: GraphicsFailed) -> None:
+        event.stop()
+        surface = self.query_one(ChartSurface)
+        if surface.pixels:
+            surface.use_text()
+            self.hub.warn(f"pixel chart unavailable; using text: {event.reason}"[:120])
+            self.call_after_refresh(self._refit)
 
     def view_df(self) -> pd.DataFrame:
         n = len(self.df)
@@ -236,171 +249,90 @@ class ChartView(View):
 
     def draw(self) -> None:
         try:
-            self._draw()
+            self._draw_scene()
         except Exception as e:  # fail soft: a bad chart must never take the app down
             self.hub.warn(f"{self.title}: chart error {type(e).__name__}: {e}"[:120])
 
-    def _draw(self) -> None:
+    def _draw_scene(self) -> None:
         if self.df is None or not len(self.df):
             return
         full, raw = self.df, self.view_df()
-        off = full.index.get_loc(raw.index[0]) if len(raw) else 0
-        n0 = len(raw)
-        plot = self.query_one(PlotextPlot)
-        plt = plot.plt
-        plt.clear_figure()
-        # NEVER combine bars (user rule): every candle is exactly one bar of the selected interval. A terminal
-        # fits at most one candle per column, so if the window holds more, keep its most recent `cols` bars;
-        # zoom-out is capped at that in on_key, and the user pans (h/l) for the rest.
-        cols = self.chart_cols()
-        if self.mode == "px" and self.ctype in ("candle", "ohlc") and n0 > cols:
-            off += n0 - cols
-            raw, n0 = raw.iloc[-cols:], cols
-        self.shown, self.total = n0, len(full)
+        off = full.index.get_loc(raw.index[0])
+        n = len(raw)
+        self.shown, self.total = n, len(full)
         self.bad_vol = int(raw["BadVol"].sum()) if "BadVol" in raw else 0
-        df = raw
-
-        def win(series: pd.Series) -> pd.Series:
-            """Indicator values for the visible window."""
-            return series.iloc[off:off + n0].reset_index(drop=True)
-
-        lower = []
-        if self.mode == "px":
-            if self.vol and "Volume" in df and float(df.Volume.fillna(0).max()) > 0:   # indexes often have none
-                lower.append("vol")
-            lower += [kk for kk in ("r", "m") if kk in self.ind]
-        # plotext gotcha: once a figure has subplots, calling a draw method on the *figure* broadcasts it to
-        # every panel. Always draw on the panel objects (P = price panel, S = lower panels).
-        if lower:
-            plt.subplots(1 + len(lower), 1)
-            P = plt.subplot(1, 1)
-        else:
-            P = plt
-        n = len(df)
-        x = list(range(n))
-        step = max(1, n // 6)
-        fmt = "%H:%M" if self.iv in ("1m", "5m", "15m") and self.rng == "1D" else "%m-%d %H:%M" if self.iv in ("1m", "5m", "15m", "1h") else "%Y-%m-%d"
-        ticks = (x[::step], [d.strftime(fmt) for d in df.index[::step]])
-        logy = self.logy and self.mode == "px"
-        T = (lambda v: [float(np.log10(a)) if a and a > 0 else 0.0 for a in v]) if logy else list
-        yjobs = []  # (panel, positions, labels): applied at the end with one shared label width so panels align
-        if self.mode == "px":
-            if self.ctype == "candle" and n <= cols // 4:
-                # room to spare: draw candles ourselves so bodies widen with the space (plotext's are 1 column).
-                # plotext rounds bar edges outward (up to ~+2 columns), so leave a 3-column margin and cap at 60% of the
-                # slot: there is always at least one empty column between neighbouring bodies.
-                per = cols / max(1, n)
-                body_w = min(0.6, max(1, int(per) - 3) / per)
-                for i, (o, h, l, c) in enumerate(zip(df.Open, df.High, df.Low, df.Close)):
-                    col = RGB_UP if c >= o else RGB_DN
-                    P.plot([i, i], T([l, h]), color=col, marker="│")
-                    lo_b, hi_b = T([min(o, c), max(o, c)])
-                    P.bar([i], [hi_b], minimum=lo_b, width=body_w, color=col, marker="█")
-            elif self.ctype == "candle":
-                P.candlestick(x, {"Open": T(df.Open), "Close": T(df.Close), "High": T(df.High), "Low": T(df.Low)},
-                              colors=[RGB_UP, RGB_DN])
-            elif self.ctype == "ohlc":
-                for i, (h, l, c, o) in enumerate(zip(df.High, df.Low, df.Close, df.Open)):
-                    P.plot([i, i], T([l, h]), color=RGB_UP if c >= o else RGB_DN, marker="│")
-                P.scatter(x, T(df.Close), marker="─", color=RGB_FG)
-            else:
-                P.plot(x, T(df.Close), color=RGB_FG, fillx=self.ctype == "area", marker="braille")
-            c_full = full.Close
-            cfg = self.app.cfg
-            ov = []
-            if "s" in self.ind:
-                ov += [(f"SMA{int(p)}", sma(c_full, p)) for p in ints(cfg.get("chart", "sma"))]
-            if "e" in self.ind:
-                ov += [(f"EMA{int(p)}", ema(c_full, p)) for p in ints(cfg.get("chart", "ema"))]
-            if "b" in self.ind:
-                n_, kb = (ints(cfg.get("chart", "bb")) + [20, 2])[:2]
-                m, sd = sma(c_full, n_), c_full.rolling(int(n_)).std()
-                ov += [("BB+", m + kb * sd), ("BBm", m), ("BB-", m - kb * sd)]
-            if "w" in self.ind and "Volume" in full:
-                ov.append(("VWAP", vwap(full)))
-            for j, (lab, sr) in enumerate(ov):
-                ys = win(sr)
-                ok = ~ys.isna()
-                if ok.any():
-                    P.plot([i for i, b in zip(x, ok) if b], T(ys[ok].clip(lower=1e-9)) if logy else ys[ok].tolist(),
-                           color=PALETTE[(j + 1) % len(PALETTE)], label=lab, marker="braille")
-            self.iex_overlay(P, df, n, T)
-            lo_, hi_ = float(df.Low.min()), float(df.High.max())
-            if logy:  # plotext's own yscale("log") crashes at render; plot log10 values and relabel the axis
-                yt = list(np.linspace(np.log10(lo_), np.log10(hi_), 6))
-                yjobs.append((P, yt, [fnum(10 ** v) for v in yt]))
-            else:
-                yt = list(np.linspace(lo_, hi_, 6))
-                yjobs.append((P, yt, [fnum(v) for v in yt]))
-        else:
-            for j, col in enumerate(df.columns):
-                P.plot(x, df[col].ffill().tolist(), color=PALETTE[j % len(PALETTE)], label=str(col), marker="braille",
-                       fillx=self.ctype == "area" and j == 0)
         if self.cx is not None:
             self.cx = max(0, min(n - 1, self.cx))
-            P.vline(self.cx, RGB_M)
-        # date labels go on the bottom-most panel only
-        P.xticks(*ticks) if not lower else P.xticks(ticks[0], [""] * len(ticks[0]))
-        sub_h = max(5, plot.size.height // 5)
-        for kk, kind in enumerate(lower, start=2):
-            S = plt.subplot(kk, 1)
-            S.plotsize(None, max(7, plot.size.height // 4) if kind == "vol" else sub_h)
-            if kind == "vol":
-                up = [(i, v) for i, (v, c, o) in enumerate(zip(df.Volume, df.Close, df.Open)) if c >= o and v > 0]
-                dn = [(i, v) for i, (v, c, o) in enumerate(zip(df.Volume, df.Close, df.Open)) if c < o and v > 0]
-                for pts, col in ((up, RGB_UP), (dn, RGB_DN)):
-                    if pts:
-                        S.bar([i for i, _ in pts], [v for _, v in pts], color=col, marker="▌", width=0.6)
-                vmax = float(df.Volume.max() or 1)
-                S.ylim(0, vmax)
-                yjobs.append((S, [0, vmax / 2, vmax], ["0", fbig(vmax / 2), fbig(vmax)]))
-            elif kind == "r":
-                S.plot(x, win(rsi(full.Close, ints(self.app.cfg.get("chart", "rsi"))[0])).fillna(50).tolist(),
-                       color=RGB_Y, label="RSI", marker="braille")
-                S.hline(70, RGB_DN)
-                S.hline(30, RGB_UP)
-                S.ylim(0, 100)
-                yjobs.append((S, [30, 50, 70], ["30", "50", "70"]))
-            elif kind == "m":
-                f, s_, gg = (ints(self.app.cfg.get("chart", "macd")) + [12, 26, 9])[:3]
-                m, sg = macd(full.Close, f, s_, gg)
-                mw, sw = win(m).fillna(0), win(sg).fillna(0)
-                S.plot(x, mw.tolist(), color=RGB_FG, label="MACD", marker="braille")
-                S.plot(x, sw.tolist(), color=RGB_Y, label="signal", marker="braille")
-                S.hline(0, RGB_DIM)
-                lo_, hi_ = float(min(mw.min(), sw.min())), float(max(mw.max(), sw.max()))
-                yjobs.append((S, [lo_, (lo_ + hi_) / 2, hi_], [fnum(lo_), fnum((lo_ + hi_) / 2), fnum(hi_)]))
-            if self.cx is not None:
-                S.vline(self.cx, RGB_M)
-            S.xticks(*ticks) if kk == len(lower) + 1 else S.xticks(ticks[0], [""] * len(ticks[0]))
-        width = max((len(l) for _, _, labs in yjobs for l in labs), default=0)
-        for panel, pos, labs in yjobs:
-            panel.yticks(pos, [l.rjust(width) for l in labs])
-        for panel in [P] + [plt.subplot(kk, 1) for kk in range(2, len(lower) + 2)]:
-            panel.xlim(-0.5, n - 0.5)   # same x-range everywhere (bars pad it otherwise) so ticks line up
-        plot.refresh()
-        self.update_info(df)
+
+        def win(series):
+            return series.iloc[off:off + n].to_numpy(dtype=float, copy=True)
+
+        cfg = self.app.cfg
+        main = Panel("Price" if self.mode == "px" else "Compare %" if self.mode == "comp" else "FRED",
+                     log=self.logy and self.mode == "px")
+        panels = [main]
+        candles, iex = None, None
+        if self.mode == "px":
+            if self.ctype in ("candle", "ohlc"):
+                candles = raw[["Open", "High", "Low", "Close"]].to_numpy(dtype=float, copy=True)
+            else:
+                main.traces.append(Trace("Close", raw.Close.to_numpy(dtype=float, copy=True), RGB_FG))
+            overlays = []
+            if "s" in self.ind:
+                overlays += [(f"SMA{int(p)}", sma(full.Close, p)) for p in ints(cfg.get("chart", "sma"))]
+            if "e" in self.ind:
+                overlays += [(f"EMA{int(p)}", ema(full.Close, p)) for p in ints(cfg.get("chart", "ema"))]
+            if "b" in self.ind:
+                period, k = (ints(cfg.get("chart", "bb")) + [20, 2])[:2]
+                mid, sd = sma(full.Close, period), full.Close.rolling(int(period)).std()
+                overlays += [("BB+", mid + k * sd), ("BBm", mid), ("BB-", mid - k * sd)]
+            if "w" in self.ind and "Volume" in full:
+                overlays.append(("VWAP", vwap(full)))
+            main.traces += [Trace(label, win(series), PALETTE[(j + 1) % len(PALETTE)])
+                            for j, (label, series) in enumerate(overlays)]
+            ev = iex_eval(self.hub, self.sec, regular_hours())
+            if ev and ev["meaningful"]:
+                iex = ev["price"]
+            if self.vol and "Volume" in raw and float(raw.Volume.fillna(0).max()) > 0:
+                values = raw.Volume.to_numpy(dtype=float, copy=True)
+                values[values < 0] = np.nan
+                panels.append(Panel("Volume", bars=values,
+                                    bar_colors=[RGB_UP if c >= o else RGB_DN for c, o in zip(raw.Close, raw.Open)],
+                                    limits=(0, max(1., float(raw.Volume.max())))))
+            if "r" in self.ind:
+                panels.append(Panel("RSI", [Trace("RSI", win(rsi(full.Close, ints(cfg.get("chart", "rsi"))[0])), RGB_Y)],
+                                    limits=(0, 100), guides=[(30, "#00FF87"), (70, "#FF4D6D")]))
+            if "m" in self.ind:
+                fast, slow, signal = (ints(cfg.get("chart", "macd")) + [12, 26, 9])[:3]
+                m, sg = macd(full.Close, fast, slow, signal)
+                hist = win(m - sg)
+                panels.append(Panel("MACD", [Trace("MACD", win(m), RGB_FG), Trace("Signal", win(sg), RGB_Y)],
+                                    bars=hist, bar_colors=[RGB_UP if v >= 0 else RGB_DN for v in hist],
+                                    guides=[(0, "#3A6B80")]))
+        else:
+            main.traces = [Trace(str(col), raw[col].to_numpy(dtype=float, copy=True), PALETTE[j % len(PALETTE)])
+                           for j, col in enumerate(raw.columns)]
+        fmt = "%H:%M" if self.iv in ("1m", "5m", "15m") and self.rng == "1D" else \
+            "%m-%d %H:%M" if self.iv in ("1m", "5m", "15m", "1h") else "%Y-%m-%d"
+        scene = Scene(panels, [d.strftime(fmt) for d in raw.index], candles, self.ctype, self.cx, iex, self.chart_font())
+        self.query_one(ChartSurface).submit(scene)
+        self.update_info(raw)
         self.render_rangebar()
         self.retitle()
-
-    def iex_overlay(self, plt, df, n, T=list) -> None:
-        """Phase 7 hook: dashed IEX line + marker when hub.iex has a meaningfully different trade."""
-        ev = iex_eval(self.hub, self.sec, regular_hours())
-        if not ev or not ev["meaningful"]:
-            return
-        px = T([ev["price"]])[0]
-        plt.scatter(list(range(0, n, 3)), [px] * len(range(0, n, 3)), marker="─", color=RGB_Y)
-        plt.scatter([n - 1], [px], marker="◆", color=RGB_Y)
 
     def update_info(self, df) -> None:
         t = Text()
         if self.mode == "px":
             q = self.hub.last.get(self.sec)
-            if q:
-                t.append(f"{self.sec} {fnum(q.price)} ", style="bold #FFFFFF")
-                t.append_text(colored(q.change, f"{fnum(q.change)} ({fnum(q.pct)}%)"))
-                t.append(" ")
-                t.append_text(tag_text(q))
+            closes = self.df.Close.replace([np.inf, -np.inf], np.nan).dropna()
+            if len(closes):
+                first, last = float(closes.iloc[0]), float(closes.iloc[-1])
+                change = last - first
+                pct = 100 * change / first if first else None
+                t.append(f"{self.sec} {fnum(last)} ", style="bold #FFFFFF")
+                t.append_text(colored(change, f"{fnum(change)} ({fnum(pct)}%)"))
+                t.append(f" {self.rng} ", style=DIM)
+                t.append_text(tag_text(q) if q else Text("DLY", style=DIM))
             ev = iex_eval(self.hub, self.sec, regular_hours())
             if ev and ev["meaningful"]:
                 arrow = "▲" if ev["diff"] >= 0 else "▼"
@@ -415,11 +347,11 @@ class ChartView(View):
             i = self.cx if self.cx is not None else len(df) - 1
             t.append(f"{df.index[i]:%Y-%m-%d}  " + "  ".join(f"{c}: {fnum(df[c].iloc[i])}{'%' if self.mode == 'comp' else ''}" for c in df.columns))
         if getattr(self, "shown", 0) < getattr(self, "total", 0):
-            t.append(f"  showing last {self.shown}/{self.total} {self.iv} bars · h/l pan · - zoom out", style=WARN) \
-                if self.zoom[1] >= 1.0 else t.append(f"  showing {self.shown}/{self.total} bars · h/l pan", style=WARN)
+            t.append(f"  showing {self.shown}/{self.total} {self.iv} bars · h/l pan · - zoom out", style=WARN)
         if getattr(self, "bad_vol", 0):
             t.append(f"  {self.bad_vol} bad Yahoo volume print{'s' if self.bad_vol > 1 else ''} hidden", style=DIM)
-        t.append(f"  [{self.ctype}{' log' if self.logy else ''}{' ' + ''.join(sorted(self.ind)) if self.ind else ''}]", style=DIM)
+        backend = self.query_one(ChartSurface).backend
+        t.append(f"  [{self.ctype}{' log' if self.logy else ''}{' ' + ''.join(sorted(self.ind)) if self.ind else ''} · {backend}]", style=DIM)
         self.info(t)
 
     # -- keys
@@ -451,7 +383,6 @@ class ChartView(View):
         elif k == "o":
             self.logy = not self.logy
             self.draw()
-            self.draw()
         elif k in ("left", "right"):
             n = len(self.view_df()) if self.df is not None else 0
             self.cx = (n - 1 if self.cx is None else self.cx + (1 if k == "right" else -1))
@@ -464,13 +395,7 @@ class ChartView(View):
             self.auto_fit = False
             n = len(self.df)
             w = (b - a) * (0.6 if k in "+=" else 1.6)
-            w_max = 1.0
-            if self.mode == "px" and self.ctype in ("candle", "ohlc"):
-                w_max = min(1.0, self.chart_cols() / n)        # one native candle per column, never combined
-            if k == "-" and (b - a) >= w_max - 1e-9 and w_max < 1.0:
-                self.hub.warn(f"zoomed out as far as native {self.iv} candles allow ({self.chart_cols()} fit); "
-                              f"h/l to pan, or ] for a coarser interval")
-            w = min(w_max, max(min(1.0, 10 / n), w))
+            w = min(1.0, max(min(1.0, 10 / n), w))
             a = 1.0 - w if b >= 1.0 else max(0.0, min(1.0 - w, (a + b) / 2 - w / 2))   # keep the latest bar pinned
             self.zoom = (a, a + w)
             self.draw()

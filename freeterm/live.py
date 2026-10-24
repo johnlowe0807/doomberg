@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import re
 import time
@@ -96,7 +97,7 @@ def _alp_headers() -> dict:
 
 def iex_symbols(hub, want) -> tuple[list[str], list[str]]:
     """Split wanted equities into (websocket ≤ cap, REST-polled rest). Earlier = higher priority."""
-    cap = int(hub.cfg.get("iex", "ws_symbol_cap", 30))
+    cap = max(0, min(30, int(hub.cfg.get("iex", "ws_symbol_cap", 30))))
     seen, eq = set(), []
     for s in want():
         if is_us_equity(s) and s not in seen:
@@ -119,20 +120,25 @@ async def alpaca_stream(hub, want) -> None:
             continue
         try:
             async with websockets.connect(ALP_WS, ping_interval=20) as ws:
-                await ws.recv()  # [{"T":"success","msg":"connected"}]
+                welcome = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
+                if not any(m.get("T") == "success" and m.get("msg") == "connected" for m in welcome):
+                    raise RuntimeError("Alpaca stream connection rejected")
                 h = _alp_headers()
                 await ws.send(json.dumps({"action": "auth", "key": h["APCA-API-KEY-ID"], "secret": h["APCA-API-SECRET-KEY"]}))
-                auth = json.loads(await ws.recv())
+                auth = json.loads(await asyncio.wait_for(ws.recv(), timeout=10))
                 if any(m.get("T") == "error" for m in auth):
                     msg = next(m.get("msg") for m in auth if m.get("T") == "error")
                     hub.streams["iex"] = f"ws:{msg}"
-                    if "auth" in str(msg).lower():
+                    if any(m.get("code") in (401, 402, 409) for m in auth) or "auth" in str(msg).lower():
                         hub.alpaca_ok, hub.alpaca_reason = False, f"Alpaca stream auth failed ({msg})"
                         hub.cfg.set("iex", "enabled", False)
                         return
                     await asyncio.sleep(30)
                     continue
+                if not any(m.get("T") == "success" and m.get("msg") == "authenticated" for m in auth):
+                    raise RuntimeError("Alpaca stream did not confirm authentication")
                 subs: list[str] = []
+                hub.streams["iex"] = "authenticated"
                 backoff = 2
                 while iex_enabled(hub):
                     ws_syms, _ = iex_symbols(hub, want)
@@ -140,18 +146,28 @@ async def alpaca_stream(hub, want) -> None:
                         drop = sorted(set(subs) - set(ws_syms))
                         if drop:
                             await ws.send(json.dumps({"action": "unsubscribe", "trades": drop}))
-                        await ws.send(json.dumps({"action": "subscribe", "trades": ws_syms}))
+                        if ws_syms:
+                            await ws.send(json.dumps({"action": "subscribe", "trades": ws_syms}))
                         subs = ws_syms
-                        hub.streams["iex"] = f"LIVE {len(subs)}"
+                        hub.streams["iex"] = f"subscribing {len(subs)}"
                     try:
                         raw = await asyncio.wait_for(ws.recv(), timeout=5)
                     except asyncio.TimeoutError:
                         continue
                     for m in json.loads(raw):
                         if m.get("T") == "t":
-                            hub.iex[m["S"]] = {"price": float(m["p"]), "ts": iso_ts(m.get("t")), "via": "ws"}
+                            record = iex_trade(m, "ws")
+                            if record:
+                                hub.iex[m["S"]] = record
+                        elif m.get("T") == "subscription":
+                            hub.streams["iex"] = f"LIVE {len(m.get('trades', []))}"
                         elif m.get("T") == "error":
                             hub.warn(f"alpaca ws: {m.get('msg')}")
+                            if m.get("code") in (401, 402, 409):
+                                hub.alpaca_ok, hub.alpaca_reason = False, f"Alpaca stream rejected ({m.get('msg')})"
+                                hub.cfg.set("iex", "enabled", False)
+                                return
+                            raise RuntimeError("Alpaca stream subscription failed")
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -163,18 +179,36 @@ async def alpaca_stream(hub, want) -> None:
 async def alpaca_poll(hub, want) -> None:
     """REST latest-trade polling for wanted symbols beyond the websocket cap (and as a ws warm-up)."""
     while True:
-        secs = float(hub.cfg.get("iex", "rest_poll_secs", 15))
-        if iex_enabled(hub):
-            ws_syms, rest = iex_symbols(hub, want)
-            batch = rest + [s for s in ws_syms if s not in hub.iex]
-            for i in range(0, len(batch), 100):
-                chunk = batch[i:i + 100]
-                url = f"{ALP_REST}?symbols={','.join(chunk)}&feed=iex"
-                d = await hub.http("alpaca", url, 3, _alp_headers(), ttl=max(1, secs - 1), retries=1)
-                for s, tr in ((d or {}).get("trades") or {}).items():
-                    if hub.iex.get(s, {}).get("via") != "ws" or s in rest:
-                        hub.iex[s] = {"price": float(tr["p"]), "ts": iso_ts(tr.get("t")), "via": "rest"}
+        secs = max(5, float(hub.cfg.get("iex", "rest_poll_secs", 15)))
+        try:
+            if iex_enabled(hub):
+                ws_syms, rest = iex_symbols(hub, want)
+                batch = rest + [s for s in ws_syms if time.time() - hub.iex.get(s, {}).get("ts", 0) > 60]
+                for i in range(0, len(batch), 100):
+                    chunk = batch[i:i + 100]
+                    url = f"{ALP_REST}?symbols={','.join(chunk)}&feed=iex"
+                    d = await hub.http("alpaca", url, 3, _alp_headers(), ttl=max(1, secs - 1), retries=1)
+                    for s, tr in ((d or {}).get("trades") or {}).items():
+                        record = iex_trade(tr, "rest")
+                        if record and record["ts"] >= hub.iex.get(s, {}).get("ts", 0):
+                            hub.iex[s] = record
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            hub.warn(f"alpaca poll: {type(e).__name__}")
         await asyncio.sleep(secs)
+
+
+def iex_trade(trade, via: str) -> dict | None:
+    """Reject missing/invalid trade data instead of inventing a fresh timestamp."""
+    try:
+        price = float(trade["p"])
+        stamp = datetime.fromisoformat(re.sub(r"(\.\d{6})\d+", r"\1", trade["t"]).replace("Z", "+00:00")).timestamp()
+        if price > 0 and math.isfinite(price) and math.isfinite(stamp):
+            return {"price": price, "ts": stamp, "via": via}
+    except (TypeError, KeyError, ValueError, AttributeError):
+        return None
+    return None
 
 
 def iex_eval(hub, sym: str, regular_hours: bool) -> dict | None:

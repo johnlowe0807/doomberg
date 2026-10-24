@@ -11,6 +11,7 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 | `app.py` | `FreeTerm` app, command parser, `Pane` (per-pane Esc history), `View` base, `MonView`, `HelpView`/`HelpScreen` (`?`), `PromptScreen`, NYSE holidays, stream startup |
 | `dialogs.py` | Shared buttonless `ConfirmScreen` styling and cancel keys, plus `QuitConfirm`. Browser confirmation subclasses the same dialog. |
 | `charts.py` | `ChartView` (GP) + `GIPView`, `CompView`, `FredView`, `SprdView`, `QuoteChartView` (bare security). Indicators (SMA/EMA/BB/VWAP/RSI/MACD), FRED CSV fetch, IEX banner and overlay |
+| `pixelcharts.py` | Shared `Scene`/`Panel`/`Trace` model, pixel geometry rasterizer, Sixel/Kitty transport, text fallback, queued worker rendering and pane-local image cleanup |
 | `boards.py` | `QuoteBoard` (WEI), CMDTY, CRYPTO, MOST, FXC matrix, HOME, GC, BTMM, AUCT, `IexView` (IEX toggle) |
 | `depth.py` | DES, HP, CN, TOP (RSS + yfinance news), OMON (local Black-Scholes greeks), `SearchView` (`/? text`) |
 | `news.py` | News article extraction, `ArticleReader` (reuses filing pager controls), `BrowserConfirm` (keyboard-only: Y opens; N/Esc/Enter cancels). HTTP via DataHub; extraction in a worker thread; article text cached for 1 hour. |
@@ -19,11 +20,10 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 | `theme.tcss` | the palette (single source of truth) |
 
 ## Gotchas learned the hard way
-- **plotext subplots broadcast.** Once a figure has `subplots()`, calling `plt.plot/bar/...` on the *figure* draws into
-  every panel (`subplot()` only changes what the figure reports as active). Always draw on the panel objects:
-  `P = plt.subplot(1, 1); P.candlestick(...)`. `ChartView._draw` does this; GC and ERN have no subplots.
-- Panels only line up when their y-tick labels share one width and they share an x-range. `_draw` collects `yjobs`,
-  right-justifies to the widest label, and sets `xlim(-0.5, n-0.5)` on each panel.
+- All chart views build geometry scenes; `ChartSurface` handles transport. Auto uses Sixel/Kitty where detected, with
+  text fallback elsewhere and in headless tests. Configure `[chart].renderer` and `font_px`.
+- **plotext subplots broadcast.** The text fallback must draw on individual panel objects after `subplots()`.
+  `pixelcharts.render_text` also gives every panel the same x-range and y-label width; pixel panels share plot bounds.
 - `PlotextPlot.render` is wrapped in `charts.py` (`_safe_render`), so a plotext exception shows a message instead of crashing.
 - Pane focus: Tab/Shift+Tab are **priority** app bindings, because Screen's built-in focus_next would otherwise win. The
   command line is outside the panes, so `App.active_pane()` remembers the last focused pane (`mark_active`, `.active` CSS class).
@@ -35,14 +35,15 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
   range/interval flip costs 0 (`tests/ranges.py` asserts this). Concurrent requests for the same base share one download
   (`_inflight`). Availability comes from `base_for()`; there is no separate interval-limit table anymore.
 - 1D/5D are trading sessions for exchange-hours symbols, and a rolling 24h/5d window for symbols that trade on weekends (crypto).
+- Month/year price ranges use calendar offsets (including leap years), rather than approximate day counts.
+- Price chart headers report the return from the first valid close to the last valid close in the full selected range,
+  labelled with that range. Zoom, pan and crosshair do not change the headline baseline; tables retain their daily moves.
 - **Never combine bars, under any circumstances** (user rule: "rendering candles correctly should be the priority").
-  Every candle is exactly one bar of the selected interval. `fit_view()` shows the most recent native bars that fit at
-  `[chart].candle_cols` columns each (default 2, which gives a gap), and the info line says `showing last N/M`. Zoom-out
-  (`-`) is capped at one candle per column and says so. `_draw` trims to the newest `cols` bars if the window ever holds
-  more (e.g. after a resize), and never aggregates. For more history, pan (h/l) or pick a coarser interval (]).
-  plotext candles are 1 column wide, so when bars have ≥2 columns `_draw` draws candles itself
-  (wick = `plot`, body = `bar(minimum=...)`) and the bodies widen. `fit_view` waits for layout (width 0 on a cache hit)
-  and refits on resize until the user pans or zooms. The volume panel is hidden when the symbol has no volume (indexes).
+  Every candle is exactly one bar of the selected interval. `fit_view()` now fits the complete selected range; geometry
+  scales candle spacing instead of silently cropping old bars. Reset (`0`), range/interval selection and automatic
+  resize preserve the whole range. Zoom-out can return to the complete range, with no minimum spacing cap.
+  `candle_px`/`candle_cols` settings are obsolete. Zoom and pan still select native bars without aggregation.
+  Candle wicks/bodies, indicators, volume and MACD bars share one x-axis. The volume panel is hidden for indexes.
 - **Yahoo 1m volume has bogus prints.** For NVDA, summed 1m volume came to 502M against an official 80M for the day, with single
   minutes claiming 30–50M. `data.flag_bad_volume` (1m base only) blanks bars above 100× the session median and sets
   `BadVol`. The chart then says "N bad Yahoo volume prints hidden". Don't apply it to 5m (clean) or crypto (false positives).
@@ -66,6 +67,9 @@ DES/HP/CN/TOP/OMON, FA (2,270 AAPL filings in FIL), ERN, EVTS, `/? apple`, an un
 MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default User-Agent.
 
 ## Completed updates
+- [x] Selected-range price indicator and candle defaults (2026-10-24): implemented the price movement requirement matching item 2 in `features-list.md` (`todo.md` was absent). Header change/% now uses first/last valid closes across the selected range and stays stable during zoom/pan/crosshair inspection. Default/reset/range changes show all native candles across the complete range; removed fixed-spacing crop/zoom caps and obsolete spacing defaults. Calendar month/year boundaries use date offsets. Verified all range defaults, exact OHLC preservation, pixel full-year output, zoom/reset/resize, return calculations and zero/missing prices; all 30 supported range/interval pairs reused four base downloads without further requests. PTY startup/confirmed exit and the full 27-command live smoke passed, with only the expected missing-Alpaca-key refusal warning.
+- [x] Geometry chart migration (2026-10-24): price/intraday, comparison, FRED/spreads, Treasury curves, earnings and home charts now share geometry scenes. Pixel output rasterizes candles, curves, indicators, signed histograms and crosshairs independently of terminal text; the text fallback consumes the same scene. Latest-frame workers, off-thread Sixel encoding, viewport/cell-size changes, pane-specific Kitty cleanup and automatic fallback are implemented. Visually inspected a four-panel raster preview; checked both image transports, four-pane controls/resize/help/close, exact native OHLC preservation, malformed/empty viewport edges, and fallback. PTY startup/confirmed exit and the full 27-command live-data smoke passed; only the expected missing-Alpaca-key refusal warned. Physical iTerm2/Kitty visual QA remains an open item.
+- [x] Expanded commodity board (2026-10-24): CMDTY now covers 28 curated Yahoo futures, capped at 50 symbols, sorted by reported contract volume from the most recent daily bar before today's New York date. The volume column includes its date. Daily bars supply quotes and ranking in one sequential batch with a shared five-minute memory/disk cache; Ctrl+R forces a new batch. App startup/confirmed exit, targeted CMDTY/MOST live smoke, and focused sorting/date/cache/cap checks passed. Live snapshot contained 28 quotes and 28 volumes dated 2026-10-23. Reaching 50 rows by adding commodity ETFs is pending the user's preference.
 - [x] Expanded search names (2026-10-23): merge duplicate symbols before display, then enrich up to 100 results in one cached Yahoo quote request through `hub.yf_call` (uses yfinance `YfData` for authenticated batch quotes). Prefer `longName` and instrument `quoteType` over abbreviated search/SEC issuer metadata; keep original alias/name matching and fuzzy matches. Removed the table's 80-character name truncation. Live checks verified full Brent futures name and BOIL fund name/ETF type; oil, filtered Brent and filtered gold smoke passed without warnings. Existing rows remain available if enrichment fails.
 - [x] Search type filters (2026-10-23): `/?brent _t=FUTURE` separates standalone `_key=value` filters from provider query text. `_t` accepts canonical quote types and aliases (CRYPTO, FX, STOCK, FUTURES), case-insensitively; applies before deduplication/limit to local, SEC, Yahoo and fuzzy results. Invalid/duplicate filters show a warning. Filter-only input browses local symbols. Verified parsing, literal non-filter terms, incremental results, filtered UI rows and Enter navigation. Live smoke passed: Brent futures 3, gold ETFs 2, Bitcoin crypto 2, unfiltered Apple 9, no warnings.
 - [x] Asset-wide `/?` search (2026-10-23): added `symbols.py` with immediate local futures/commodity, crypto (full names), FX, index, ETF and alias matches. Yahoo searches up to 100 results across supported quote types, including mutual funds and international listings; SEC runs independently. Results rank exact symbols first, deduplicate by canonical ticker, and show type/source. Live smoke passed: gold 100, Bitcoin 23, EURUSD 5, Apple 9, without warnings. Offline checks covered commodity/crypto categories, natural gas, Ripple, exact tickers, duplicate removal, fuzzy Yahoo results and SEC failure.
@@ -80,12 +84,14 @@ MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default 
       30-symbol cap, the banner text and the dashed line, and REST polling for symbols beyond the cap.
 - [ ] Verify interactive behavior in a real terminal (macOS Terminal + iTerm): price flash, focus colors, Tab between panes,
       and that `Ctrl+1/2/4` arrive (Terminal.app usually doesn't send them; `/LAYOUT n` is the fallback).
+- [ ] Visually check Sixel in iTerm2 and image output in Kitty on physical terminals (font-size changes, modal clipping,
+      resize and pane closure). Protocol widgets, generated frames and pane-specific cleanup passed automated checks.
 - [ ] FA uses calendar-aligned XBRL frames (CY2023 etc.), so fiscal years that end mid-year are labelled by the nearest
       calendar year. Consider labelling by `fy` from 10-K rows instead.
 - [ ] Optional from brief: EX-27 financial data schedule parsing for late-1990s filings (not built).
 - [ ] MOST ranks a fixed 40-name large-cap universe (deterministic). `yf.screen("day_gainers")` could replace it with a fallback.
 - [ ] GC custom-date overlay uses FRED DGS* series (back to 1962 for most tenors). The treasury.gov par-curve CSV is not used.
-- [ ] OHLC chart type draws one plotext series per bar. It's fine for ≤ ~300 bars but slow on MAX/1wk.
+- [ ] Text fallback OHLC draws one plotext series per bar and can be slow on large windows; pixel rendering uses geometry directly.
 - [ ] Market holidays are hardcoded for 2025–2027 (`app.NYSE_HOLIDAYS`). Early closes are not modeled.
 
 ## Smoke test (run after every change)

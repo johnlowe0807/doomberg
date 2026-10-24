@@ -245,6 +245,9 @@ def slice_range(df, rng: str):
         return df[idx.normalize() >= days[-min(n, len(days))]]
     if rng == "YTD":
         start = pd.Timestamp(year=idx[-1].year, month=1, day=1, tz=idx.tz)
+    elif rng in ("1M", "3M", "6M", "1Y", "5Y"):
+        amount = int(rng[:-1])
+        start = idx[-1] - pd.DateOffset(**{"months" if rng.endswith("M") else "years": amount})
     else:
         start = idx[-1] - pd.Timedelta(days=RANGE_DAYS[rng])
     return df[idx >= start]
@@ -262,7 +265,7 @@ class DataHub:
         self.disk = DiskCache("snap")
         self.limiters = {"yf": RateLimiter("yf", 2.0, 4)}
         self.yf = YFProvider(self.limiters["yf"])
-        self.quote_chain: list[Provider] = [self.yf]   # TODO phase 7: Coinbase for crypto, Alpaca IEX overlay
+        self.quote_chain: list[Provider] = [self.yf]   # fresh Coinbase quotes in self.last bypass polling
         self.last: dict[str, Quote] = {}
         self.warnings: list[str] = []
         self.streams: dict[str, str] = {}          # stream name -> state, shown in status bar
@@ -275,16 +278,21 @@ class DataHub:
                 self.last[s] = Quote(**d)
             except TypeError:
                 pass
-        self.alpaca_ok = bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET"))
-        self.alpaca_reason = "" if self.alpaca_ok else "no ALPACA_API_KEY/ALPACA_API_SECRET"
-        # NOTE: alpaca_ok must ALSO be confirmed by validate_alpaca() before the IEX overlay may turn on.
+        self.alpaca_ok = False  # Only validate_alpaca may enable this, after an HTTP 200.
+        self.alpaca_reason = "Alpaca keys awaiting validation" if (
+            os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET")
+        ) else "no ALPACA_API_KEY/ALPACA_API_SECRET"
 
     def warn(self, msg: str) -> None:
         self.warnings = (self.warnings + [msg])[-5:]
 
     async def validate_alpaca(self) -> None:
         """GET latest IEX trade; anything but 200 disables the overlay permanently for the session."""
-        if not self.alpaca_ok:
+        if not (os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_API_SECRET")):
+            self.alpaca_ok = False
+            self.alpaca_reason = "no ALPACA_API_KEY/ALPACA_API_SECRET"
+            if self.cfg.get("iex", "enabled"):
+                self.cfg.set("iex", "enabled", False)
             return
         try:
             import httpx
@@ -294,6 +302,8 @@ class DataHub:
                 r = await c.get("https://data.alpaca.markets/v2/stocks/SPY/trades/latest?feed=iex", headers=h)
             if r.status_code != 200:
                 self.alpaca_ok, self.alpaca_reason = False, f"Alpaca keys rejected (HTTP {r.status_code})"
+            else:
+                self.alpaca_ok, self.alpaca_reason = True, ""
         except Exception as e:
             self.alpaca_ok, self.alpaca_reason = False, f"Alpaca unreachable ({type(e).__name__})"
         if not self.alpaca_ok and self.cfg.get("iex", "enabled"):

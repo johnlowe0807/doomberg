@@ -22,6 +22,12 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
 - Settings: `~/.freeterm/config.toml`, `aliases.toml`, `watchlist.json` (created on first run). Set `[sec].user_agent`
   to include a real contact; SEC asks for one.
 - Layout: `Ctrl+1/2/4`, or `/LAYOUT 1|2|4` (macOS Terminal doesn't send Ctrl+digit).
+- Charts automatically use pixel graphics in iTerm2 (Sixel) and Kitty, with text fallback elsewhere.
+  Candles, indicator curves, and MACD histograms use pixel geometry independent of terminal text size.
+  Price, comparison, rates/spreads, Treasury curve, and earnings charts share the same scene model.
+  In `[chart]`, `renderer = "auto"` can be overridden with `"text"`, `"sixel"`, or `"tgp"` (restart to apply).
+  `font_px = 12` sets chart label size. Candle width fits the complete selected range by default;
+  zoom never combines candles. The quote header shows the return over that selected range.
 - News: Enter on a headline in `/CN AAPL` or `/TOP` opens a text reader. Use `j/k` to scroll, `/` to search,
   and `q`/Escape to return. If article text is unavailable, the reader shows the feed summary when available.
   Press `o` to request the original in a browser; the keyboard confirmation uses `y`/`Y` to open and

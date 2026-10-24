@@ -2,20 +2,22 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from dataclasses import asdict
 
 import pandas as pd
+import numpy as np
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.binding import Binding
-from textual.containers import Horizontal
+from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Static
-from textual_plotext import PlotextPlot
 
 from .app import DIM, WARN, VIEWS, View, MonView, PromptScreen, fbig, fnum, colored, tag_text
 from .charts import QuoteChartView, fred, PALETTE
 from .data import Quote, RateLimiter, _sub
+from .pixelcharts import ChartSurface, Panel, Scene, Trace
 
 BOARDS = {
     "WEI": [("^GSPC", "S&P 500"), ("^DJI", "Dow Jones"), ("^IXIC", "Nasdaq Comp"), ("^RUT", "Russell 2000"),
@@ -98,12 +100,14 @@ class CmdtyBoard(QuoteBoard):
         return "CMDTY prior-day volume (50 max, curated futures)"
 
     def on_mount(self):
-        self.snapshot_key = "cmdty-daily:" + ",".join(s for s, _ in BOARDS[self.board])
+        symbols = ",".join(s for s, _ in BOARDS[self.board][:self.LIMIT])
+        self.snapshot_key = "cmdty-daily-" + hashlib.sha256(symbols.encode()).hexdigest()[:16]
         snapshot = self.hub.disk.get(self.snapshot_key) or {}
-        cache_key = f"{self.snapshot_key}:{pd.Timestamp.now(tz='America/New_York').date()}"
+        today = str(pd.Timestamp.now(tz="America/New_York").date())
+        cache_key = f"{self.snapshot_key}:{today}"
         fetched = min((q["fetched"] for q in snapshot.get("quotes", {}).values()), default=0)
         remaining = self.refresh_secs - (time.time() - fetched)
-        if remaining > 0 and self.hub.mem.get(cache_key) is None:
+        if remaining > 0 and snapshot.get("rank_date") == today and self.hub.mem.get(cache_key) is None:
             self.hub.mem.put(cache_key, snapshot, remaining)
         self.volumes = snapshot.get("volumes", {})
         super().on_mount()
@@ -114,7 +118,7 @@ class CmdtyBoard(QuoteBoard):
         def rank(row):
             volume = self.volumes.get(row[0], {}).get("volume")
             return (volume is None, -(volume or 0), row[0])
-        return sorted(self.rows, key=rank)[:self.LIMIT]
+        return sorted(self.rows[:self.LIMIT], key=rank)
 
     def volume_text(self, symbol, quote):
         entry = self.volumes.get(symbol, {})
@@ -130,7 +134,7 @@ class CmdtyBoard(QuoteBoard):
             # Daily bars supply both quotes and ranking: no extra intraday requests.
             frame = yf.download(symbols, period="5d", interval="1d", group_by="ticker",
                                 auto_adjust=False, progress=False, threads=False)
-            snapshot = {"quotes": {}, "volumes": {}}
+            snapshot = {"quotes": {}, "volumes": {}, "rank_date": str(today)}
             for symbol in symbols:
                 bars = _sub(frame, symbol)
                 if bars is None or "Close" not in bars:
@@ -155,7 +159,6 @@ class CmdtyBoard(QuoteBoard):
         snapshot = await self.hub.yf_call(f"{self.snapshot_key}:{today}", self.refresh_secs, download)
         if snapshot:
             self.hub.disk.put(self.snapshot_key, snapshot)
-        if snapshot:
             self.volumes = snapshot["volumes"]
             self.render_rows({s: Quote(**q) for s, q in snapshot["quotes"].items()})
         else:
@@ -164,33 +167,65 @@ class CmdtyBoard(QuoteBoard):
 
 class CryptoBoard(QuoteBoard):
     FUNC = board = "CRYPTO"
-    hints = "Enter open  (Coinbase live stream: phase 7)"
+    hints = "Enter open  Coinbase live where available; Yahoo fallback"
 
 
 class MostBoard(QuoteBoard):
-    """Movers from a liquid large-cap universe (yf.screen is flaky; fallback universe is deterministic)."""
+    """Yahoo screeners with a liquid large-cap fallback when screening is unavailable."""
     FUNC, board = "MOST", "MOSTU"
     hints = "s cycle gainers/losers/active  Enter open"
     modes = ["gainers", "losers", "active"]
 
     def on_mount(self) -> None:
         self.m = 0
+        self.screened = False
         super().on_mount()
+
+    async def load(self) -> None:
+        import yfinance as yf
+        mode = self.modes[self.m]
+        query = {"gainers": "day_gainers", "losers": "day_losers", "active": "most_actives"}[mode]
+        data = await self.hub.yf_call(f"screen:{query}", 300, lambda: yf.screen(query, count=50))
+        quotes, rows = {}, []
+        for item in (data or {}).get("quotes", []):
+            symbol, price = item.get("symbol"), item.get("regularMarketPrice")
+            if not symbol or price is None or symbol in quotes:
+                continue
+            previous = item.get("regularMarketPreviousClose")
+            if previous is None and item.get("regularMarketChange") is not None:
+                previous = price - item["regularMarketChange"]
+            quotes[symbol] = Quote(symbol, price=price, prev_close=previous,
+                                   volume=item.get("regularMarketVolume"), day_low=item.get("regularMarketDayLow"),
+                                   day_high=item.get("regularMarketDayHigh"), ts=item.get("regularMarketTime"),
+                                   fetched=time.time())
+            rows.append((symbol, item.get("longName") or item.get("shortName") or symbol))
+        if mode != self.modes[self.m]:
+            return
+        self.screened = bool(rows)
+        self.rows = rows or BOARDS[self.board]
+        if not rows:
+            quotes = await self.hub.quotes([s for s, _ in self.rows])
+        self.render_rows(quotes)
+        self.retitle()
+        if isinstance(self.parent, Vertical) and self.parent.id == "home-movers":
+            self.parent.query_one("#home-movers-label", Static).update(self.title)
 
     def ordered(self, qs):
         have = [r for r in self.rows if r[0] in qs and qs[r[0]].pct is not None]
         key = {"gainers": lambda r: -qs[r[0]].pct, "losers": lambda r: qs[r[0]].pct,
-               "active": lambda r: -(qs[r[0]].volume or 0) * (qs[r[0]].price or 0)}[self.modes[self.m]]
+               "active": lambda r: -(qs[r[0]].volume or 0)}[self.modes[self.m]]
         return sorted(have, key=key)
 
     @property
     def title(self) -> str:
-        return f"MOST {self.modes[getattr(self, 'm', 0)]} (large-cap universe)"
+        source = "Yahoo screener" if getattr(self, "screened", False) else "large-cap fallback"
+        return f"MOST {self.modes[getattr(self, 'm', 0)]} ({source})"
 
     def key_s(self) -> None:
         self.m = (self.m + 1) % 3
-        self.parent.query_one(".title", Static).update(self.title) if self.parent else None
-        self.render_rows(self.hub.cached_quotes([s for s, _ in self.rows]))
+        self.screened = False
+        self.retitle()
+        self.reload()
 
 
 class FxcView(View):
@@ -224,15 +259,46 @@ class FxcView(View):
 
 class HomeView(View):
     FUNC = "HOME"
-    hints = "Tab panes  /MON /WEI /GP …  Enter on a row opens it"
+    hints = "[ ] watchlist/movers/headlines  Enter open  arrows preview watchlist chart  s sort/movers"
+    BINDINGS = [Binding("left_square_bracket", "section(-1)", show=False),
+                Binding("right_square_bracket", "section(1)", show=False)]
     refresh_secs = 20
 
     def compose(self) -> ComposeResult:
+        from .depth import NewsView
         yield Static("", id="tape", classes="msg")
-        with Horizontal():
-            yield MonView(self.hub, None, [])
+        with Horizontal(id="home-upper"):
+            with Vertical():
+                yield Static("WATCHLIST", classes="msg")
+                yield MonView(self.hub, None, [])
             yield QuoteChartView(self.hub, "^GSPC", ["3M"])
+        with Horizontal(id="home-lower"):
+            with Vertical(id="home-movers"):
+                yield Static("MOVERS", id="home-movers-label", classes="msg")
+                yield MostBoard(self.hub, None, [])
+            with Vertical():
+                yield Static("HEADLINES", classes="msg")
+                yield NewsView(self.hub, None, [])
         yield Static("", id="rates", classes="msg")
+
+    def on_data_table_row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        if event.data_table.id != "mon":
+            return
+        symbol = event.row_key.value
+        chart = self.query_one(QuoteChartView)
+        timer = getattr(self, "preview_timer", None)
+        if timer:
+            timer.stop()
+        if symbol and symbol != chart.sec:
+            self.preview_timer = self.set_timer(0.3, lambda: self.preview(symbol))
+
+    def preview(self, symbol: str) -> None:
+        chart = self.query_one(QuoteChartView)
+        chart.sec = symbol
+        chart.df = None
+        chart.zoom, chart.cx, chart.fit_pending = (0.0, 1.0), None, True
+        chart.prefetched = False
+        chart.reload()
 
     async def load(self) -> None:
         qs = await self.hub.quotes([s for s, _ in TAPE])
@@ -271,13 +337,12 @@ class GCView(View):
 
     def compose(self) -> ComposeResult:
         yield DataTable(cursor_type="row")
-        yield PlotextPlot()
+        yield ChartSurface(self.app.cfg.get("chart", "renderer", "auto"))
         yield Static("Dealer quotes, swaps and corporate bond trades are not available from free sources.", classes="msg")
 
     def on_mount(self) -> None:
         self.chart, self.custom = False, None
-        self.query_one(PlotextPlot).display = False
-        self.query_one(PlotextPlot).theme = "clear"
+        self.query_one(ChartSurface).display = False
         super().on_mount()
 
     async def load(self) -> None:
@@ -296,21 +361,18 @@ class GCView(View):
         self.draw()
 
     def draw(self) -> None:
-        p = self.query_one(PlotextPlot)
-        plt = p.plt
-        plt.clear_figure()
-        x = list(range(len(TENORS)))
-        for j, (n, _, ys) in enumerate(getattr(self, "curves", [])):
-            pts = [(i, y) for i, y in zip(x, ys) if y is not None]
-            if pts:
-                plt.plot([a for a, _ in pts], [b for _, b in pts], label=n, color=PALETTE[j], marker="braille")
-        plt.xticks(x, [n for n, _ in TENORS])
-        p.refresh()
+        traces = [Trace(name, np.asarray(ys, dtype=float), PALETTE[j % len(PALETTE)])
+                  for j, (name, _, ys) in enumerate(getattr(self, "curves", []))]
+        self.query_one(ChartSurface).submit(Scene([Panel("Treasury yield %", traces)],
+                                                [name for name, _ in TENORS],
+                                                font_size=int(self.app.cfg.get("chart", "font_px", 12))))
 
     def key_t(self) -> None:
         self.chart = not self.chart
-        self.query_one(PlotextPlot).display = self.chart
+        self.query_one(ChartSurface).display = self.chart
         self.query_one(DataTable).display = not self.chart
+        if self.chart:
+            self.call_after_refresh(self.draw)
 
     def key_d(self) -> None:
         def setd(v: str) -> None:

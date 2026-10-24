@@ -22,6 +22,8 @@ DEFAULT_CONFIG: dict = {
         "rest_poll_secs": 15,
     },
     "chart": {
+        "renderer": "auto",  # auto (Sixel/Kitty when supported), text, sixel, tgp
+        "font_px": 12,       # chart labels are independent of the terminal font
         "type": "candle",
         "volume": True,
         "log": False,
@@ -30,7 +32,6 @@ DEFAULT_CONFIG: dict = {
         "bb": "20,2",
         "rsi": "14",
         "macd": "12,26,9",
-        "candle_cols": 2,   # columns per candle in the default view (2 = gap between candles, 1 = densest)
     },
     "options": {"strikes_each_side": 12, "risk_free_fallback": 0.045},
     "sec": {"user_agent": "freeterm/0.1 personal-research freeterm@example.com"},

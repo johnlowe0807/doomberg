@@ -23,6 +23,7 @@ from textual.widgets import DataTable, Input, Static
 from .config import Config, load_aliases, load_watchlist, save_watchlist
 from .data import DataHub, Quote
 from .dialogs import QuitConfirm
+from .market import market_status
 
 UP, DOWN, WARN, DIM = "#00FF87", "#FF4D6D", "#FFD700", "#3A6B80"
 ET = ZoneInfo("America/New_York")
@@ -62,33 +63,6 @@ def colored(v, s: str) -> Text:
 def tag_text(q: Quote) -> Text:
     t = q.tag
     return Text(t, style={"LIVE": UP, "STALE": WARN}.get(t, DIM))
-
-
-# NYSE full-day closures (extend yearly). Early closes (13:00 ET) are not modeled.
-NYSE_HOLIDAYS = {
-    "2025-01-01", "2025-01-09", "2025-01-20", "2025-02-17", "2025-04-18", "2025-05-26", "2025-06-19", "2025-07-04",
-    "2025-09-01", "2025-11-27", "2025-12-25",
-    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03", "2026-05-25", "2026-06-19", "2026-07-03", "2026-09-07",
-    "2026-11-26", "2026-12-25",
-    "2027-01-01", "2027-01-18", "2027-02-15", "2027-03-26", "2027-05-31", "2027-06-18", "2027-07-05", "2027-09-06",
-    "2027-11-25", "2027-12-24",
-}
-
-
-def market_status() -> str:
-    now = datetime.now(ET)
-    if now.weekday() >= 5:
-        return "US CLOSED (wknd)"
-    if now.strftime("%Y-%m-%d") in NYSE_HOLIDAYS:
-        return "US CLOSED (hol)"
-    m = now.hour * 60 + now.minute
-    if 570 <= m < 960:
-        return "US OPEN"
-    if 240 <= m < 570:
-        return "US PRE"
-    if 960 <= m < 1200:
-        return "US POST"
-    return "US CLOSED"
 
 
 def regular_hours() -> bool:

@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+from datetime import date
 
 import pandas as pd
+import numpy as np
 from rich.text import Text
 from textual import on
 from textual.app import ComposeResult
@@ -13,10 +15,10 @@ from textual.containers import Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Input, OptionList, Static, TextArea
 from textual.widgets.text_area import Selection
-from textual_plotext import PlotextPlot
 
 from .app import DIM, UP, DOWN, WARN, VIEWS, View, colored, fnum, load_watchlist
 from .charts import RGB_UP, RGB_DN
+from .pixelcharts import ChartSurface, Panel, Scene
 
 SEC_RATE = 8.0  # SEC asks for <=10 req/s
 
@@ -297,33 +299,88 @@ STATEMENTS = {
 }
 
 
-def xbrl_line(facts: dict, concepts: list[str], kind: str, annual: bool) -> dict[str, float]:
-    """Merge alternate concepts per period using XBRL `frame` (CY2023 / CY2023Q1 / CY2023Q4I)."""
+def fiscal_calendar(facts: dict) -> list[tuple[date, int]]:
+    """Identify each filing's own fiscal end, excluding its comparative years."""
     taxo = {**facts.get("facts", {}).get("ifrs-full", {}), **facts.get("facts", {}).get("us-gaap", {})}
-    out: dict[str, float] = {}
-    for c in concepts:
-        f = taxo.get(c)
-        if not f:
-            continue
-        for unit, arr in f.get("units", {}).items():
-            for x in arr:
-                fr = x.get("frame") or ""
+    concepts = {c for _, kind, lines in STATEMENTS.values() if kind == "flow" for _, cs, _ in lines for c in cs}
+    filings = {}
+    for concept in concepts:
+        for records in taxo.get(concept, {}).get("units", {}).values():
+            for x in records:
+                if not str(x.get("form", "")).startswith(("10-K", "20-F", "40-F")) or not x.get("fy"):
+                    continue
+                try:
+                    end, start = date.fromisoformat(x["end"]), date.fromisoformat(x["start"])
+                    filed = x["filed"]
+                    if not 300 <= (end - start).days <= 400 or x["end"] > filed:
+                        continue
+                    key = (x.get("accn", filed), int(x["fy"]), filed)
+                    filings[key] = max(end, filings.get(key, end))
+                except (KeyError, TypeError, ValueError):
+                    continue
+    anchors = {}
+    for (_, fy, filed), end in sorted(filings.items(), key=lambda kv: kv[0][2]):
+        anchors.setdefault(end, fy)
+    return sorted(anchors.items())
+
+
+def fiscal_period(end: date, calendar: list[tuple[date, int]]) -> tuple[int, int] | None:
+    # Match the nearest known fiscal year-end, then count quarters from it. This also
+    # covers the current unfinished year and 52/53-week reporting calendars.
+    if not calendar:
+        return None
+    anchor, year = min(calendar, key=lambda row: abs((row[0] - end).days))
+    quarters = round((end - anchor).days / 91.3125)
+    if abs((end - anchor).days - quarters * 91.3125) > 25:
+        return None
+    return year + (quarters + 3) // 4, (quarters - 1) % 4 + 1
+
+
+def xbrl_line(facts: dict, concepts: list[str], kind: str, annual: bool,
+              calendar: list[tuple[date, int]] | None = None) -> dict[str, float]:
+    """Use actual fiscal periods; derive standalone cash-flow quarters from YTD facts."""
+    calendar = fiscal_calendar(facts) if calendar is None else calendar
+    taxo = {**facts.get("facts", {}).get("ifrs-full", {}), **facts.get("facts", {}).get("us-gaap", {})}
+    picked, cumulative = {}, {}
+    for priority, concept in enumerate(concepts):
+        unit = "USD/shares" if concept.startswith("EarningsPerShare") else "shares" if "Shares" in concept else "USD"
+        for x in taxo.get(concept, {}).get("units", {}).get(unit, []):
+            if not str(x.get("form", "")).startswith(("10-K", "10-Q", "20-F", "40-F")):
+                continue
+            try:
+                end = date.fromisoformat(x["end"])
+                period = fiscal_period(end, calendar)
+                if period is None:
+                    continue
+                year, quarter = period
+                rank = (x.get("filed", ""), -priority)
+                label = str(year) if annual else f"{year}Q{quarter}"
+                value = float(x["val"])
                 if kind == "inst":
-                    m = re.fullmatch(r"CY(\d{4})Q(\d)I", fr)
-                    if not m:
+                    if annual and quarter != 4:
                         continue
-                    if annual:
-                        if not str(x.get("form", "")).startswith(("10-K", "20-F", "40-F")):
-                            continue
-                        lab = m.group(1)
-                    else:
-                        lab = f"{m.group(1)}Q{m.group(2)}"
                 else:
-                    m = re.fullmatch(r"CY(\d{4})" if annual else r"CY(\d{4})Q(\d)", fr)
-                    if not m:
+                    duration = (end - date.fromisoformat(x["start"])).days
+                    if annual:
+                        if quarter != 4 or not 300 <= duration <= 400:
+                            continue
+                    elif not 60 <= duration <= 120:
+                        if unit == "USD" and abs(duration - quarter * 91.3125) <= 30:
+                            if label not in cumulative or rank > cumulative[label][0]:
+                                cumulative[label] = (rank, value)
                         continue
-                    lab = m.group(1) if annual else f"{m.group(1)}Q{m.group(2)}"
-                out.setdefault(lab, float(x["val"]))
+                if label not in picked or rank > picked[label][0]:
+                    picked[label] = (rank, value)
+            except (KeyError, TypeError, ValueError):
+                continue
+    out = {label: value for label, (_, value) in picked.items()}
+    if not annual and kind == "flow":
+        for label, (_, value) in sorted(cumulative.items()):
+            year, quarter = label.split("Q")
+            q = int(quarter)
+            previous = [out.get(f"{year}Q{i}") for i in range(1, q)]
+            if label not in out and all(v is not None for v in previous):
+                out[label] = value - sum(previous)
     return out
 
 
@@ -357,16 +414,17 @@ class FaView(View):
         if self.facts:
             name, kind, lines = STATEMENTS[self.stmt]
             rows = []
+            calendar = fiscal_calendar(self.facts)
             for lab, concepts, unit in lines:
-                d = xbrl_line(self.facts, concepts, kind, self.annual)
-                if not self.annual and kind == "flow" and unit == M:
-                    derive_q4(d, xbrl_line(self.facts, concepts, kind, True))
+                d = xbrl_line(self.facts, concepts, kind, self.annual, calendar)
+                if not self.annual and kind == "flow" and unit == M and not any("Shares" in c for c in concepts):
+                    derive_q4(d, xbrl_line(self.facts, concepts, kind, True, calendar))
                 rows.append((lab, d, unit))
             if self.stmt == "cash":
                 ocf, capex = rows[0][1], rows[3][1]
-                rows.insert(4, ("Free cash flow", {p: ocf[p] - capex.get(p, 0) for p in ocf}, M))
+                rows.insert(4, ("Free cash flow", {p: ocf[p] - capex[p] for p in ocf if p in capex}, M))
             periods = sorted({p for _, d, _ in rows for p in d}, reverse=True)
-            self.src = "SEC EDGAR XBRL (frames; calendar-aligned)"
+            self.src = "SEC EDGAR XBRL (fiscal years; latest reported values)"
             self.fill(name, periods, rows)
         else:
             self.run_worker(self.yf_fallback(), exclusive=True, group="fa")
@@ -518,11 +576,10 @@ class ErnView(View):
         yield Static("", classes="msg", id="ernhdr")
         with Horizontal():
             yield DataTable(cursor_type="row", id="eps")
-            yield PlotextPlot(id="surp")
+            yield ChartSurface(self.app.cfg.get("chart", "renderer", "auto"), id="surp")
         yield DataTable(cursor_type="row", id="k8")
 
     def on_mount(self) -> None:
-        self.query_one(PlotextPlot).theme = "clear"
         self.k8, self.cik = [], None
         super().on_mount()
 
@@ -549,15 +606,12 @@ class ErnView(View):
         self.query_one("#ernhdr", Static).update(Text(
             f"{self.sec} next earnings: {nxt:%Y-%m-%d %H:%M %Z}" if nxt is not None else f"{self.sec} next earnings: N/A",
             style="bold #FFFFFF"))
-        p = self.query_one(PlotextPlot)
-        plt = p.plt
-        plt.clear_figure()
         past = sorted(past)[-16:]
-        if past:
-            plt.bar([d.strftime("%y-%m") for d, _ in past], [v for _, v in past],
-                    color=[RGB_UP if v >= 0 else RGB_DN for _, v in past], marker="▌")
-            plt.title("EPS surprise %")
-        p.refresh()
+        self.query_one(ChartSurface).submit(Scene(
+            [Panel("EPS surprise %", bars=np.asarray([value for _, value in past], dtype=float),
+                   bar_colors=[RGB_UP if value >= 0 else RGB_DN for _, value in past], guides=[(0, "#3A6B80")])],
+            [day.strftime("%y-%m") for day, _ in past],
+            font_size=int(self.app.cfg.get("chart", "font_px", 12))))
         self.cik = await cik_for(self.hub, self.sec)
         k = self.query_one("#k8", DataTable)
         k.clear(columns=True)
