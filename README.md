@@ -11,6 +11,12 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
 - An uppercase letter opens the command line for a ticker (`AAPL`); `/` opens it for a command
   (`/WEI`, `/GC`, `/FA AAPL`, `AAPL /FA`, `/COMP SPY QQQ`, `/? apple`). Commands require `/`;
   bare words always select symbols. Press `?` or run `/HELP` for help.
+- Search across asset types: `/? gold`, `/? natural gas`, `/? bitcoin`, `/? crypto`, `/? EURUSD`,
+  or any Yahoo-supported ticker/name (stocks, ETFs, mutual funds, futures, FX and indexes).
+  Filter by type with `/?brent _t=FUTURE`, `/?bitcoin _t=CRYPTO`, or `/?gold _t=ETF`.
+  Types: EQUITY, FUTURE, CRYPTOCURRENCY (or CRYPTO), CURRENCY (or FX), ETF, INDEX, MUTUALFUND.
+  Filters are case-insensitive, standalone `_t=TYPE` tokens; plain `t=...` remains search text.
+  Local matches appear immediately; Yahoo and SEC add results. Enter opens the selected symbol.
 - Optional IEX overlay: `export ALPACA_API_KEY=... ALPACA_API_SECRET=...`. The keys are checked at startup. If they're missing or
   rejected, the overlay can't be turned on and the status bar says why.
 - Settings: `~/.freeterm/config.toml`, `aliases.toml`, `watchlist.json` (created on first run). Set `[sec].user_agent`

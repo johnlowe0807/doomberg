@@ -511,7 +511,8 @@ class FilView(View):
 # ---------------------------------------------------------------- ERN
 class ErnView(View):
     FUNC = "ERN"
-    hints = "Tab to 8-K list, Enter opens the EX-99.1 press release"
+    BINDINGS = [Binding("[", "section(-1)", show=False), Binding("]", "section(1)", show=False)]
+    hints = "[ ] switch EPS / 8-K list  Enter on 8-K opens the EX-99.1 press release"
 
     def compose(self) -> ComposeResult:
         yield Static("", classes="msg", id="ernhdr")

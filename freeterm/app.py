@@ -179,6 +179,13 @@ class View(Vertical):
     async def load(self) -> None:
         pass
 
+    def action_section(self, direction: int) -> None:
+        tables = list(self.query(DataTable))
+        if tables:
+            focused = self.app.focused
+            index = tables.index(focused) if focused in tables else (0 if direction < 0 else -1)
+            tables[(index + direction) % len(tables)].focus()
+
 
 class StubView(View):
     def compose(self) -> ComposeResult:
@@ -329,7 +336,7 @@ FUNC_HELP = [
     ("HOME", "home dashboard"), ("WEI", "world indices"), ("MOST", "movers"), ("CMDTY", "commodities"), ("FXC", "FX cross matrix"),
     ("CRYPTO", "crypto (Coinbase live)"), ("TOP", "top news (RSS)"), ("GC", "Treasury curve"), ("BTMM", "rates / money markets"),
     ("SPRD", "IG/HY spreads + 2s10s"), ("AUCT", "Treasury auctions"), ("FRED <ID>", "chart any FRED series"),
-    ("IEX", "toggle Alpaca IEX overlay"), ("? <text>", "search securities"), ("LAYOUT 1|2|4", "pane layout"), ("HELP", "this help"),
+    ("IEX", "toggle Alpaca IEX overlay"), ("? <text> [_t=TYPE]", "search securities; filter by type, e.g. _t=FUTURE"), ("LAYOUT 1|2|4", "pane layout"), ("HELP", "this help"),
 ]
 
 

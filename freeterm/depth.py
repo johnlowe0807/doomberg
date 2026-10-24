@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import math
 import time
 from datetime import datetime, timezone
@@ -313,7 +312,7 @@ class OmonView(View):
 # ---------------------------------------------------------------- search
 class SearchView(View):
     FUNC = "SEARCH"
-    hints = "Enter open security  (EDGAR company names + Yahoo search + aliases)"
+    hints = "Enter open  /? text _t=TYPE  (EQUITY, FUTURE, CRYPTO, CURRENCY, ETF, INDEX, MUTUALFUND)"
 
     @property
     def title(self) -> str:
@@ -323,45 +322,31 @@ class SearchView(View):
         yield DataTable(cursor_type="row")
 
     async def load(self) -> None:
-        from .fundamentals import edgar_tickers
+        from .symbols import search_symbols
         q = " ".join(self.args).strip()
-        ql = q.lower()
-        rows: list[tuple[str, str, str]] = []
-        for k, v in self.app.aliases.items():
-            if ql in k.lower() or ql in v.lower():
-                rows.append((k, v, "alias"))
-        tick = await edgar_tickers(self.hub)
-        scored = []
-        for sym, (_, name) in tick.items():
-            n = name.lower()
-            if ql == sym.lower():
-                scored.append((0, sym, name))
-            elif ql in n:
-                scored.append((1 + n.index(ql) / 100, sym, name))
-        scored.sort()
-        rows += [(s, n, "EDGAR") for _, s, n in scored[:40]]
+        if not q:
+            self.render_matches([])
+            self.hub.warn("Search: enter a ticker, asset name, or type after /?")
+            return
         try:
-            import yfinance as yf
-            res = await self.hub.yf_call(f"search:{ql}", 600, lambda: yf.Search(q, max_results=15).quotes)
-            for r in res or []:
-                if r.get("symbol"):
-                    rows.append((r["symbol"], r.get("longname") or r.get("shortname") or "", r.get("quoteType", "yahoo")))
-        except Exception:
-            pass
-        if not rows:
-            names = {n.lower(): s for s, (_, n) in tick.items()}
-            for m in difflib.get_close_matches(ql, list(names), n=10, cutoff=0.5):
-                rows.append((names[m], m, "fuzzy"))
-        t = self.query_one(DataTable)
-        t.clear(columns=True)
-        t.add_columns("Symbol", "Name", "Type")
-        seen = set()
-        for s, n, ty in rows:
-            if s not in seen:
-                seen.add(s)
-                t.add_row(Text(s, style="bold"), n[:60], Text(ty, style=DIM), key=s)
+            rows = await search_symbols(self.hub, q, self.app.aliases, self.render_matches)
+        except ValueError as exc:
+            self.render_matches([])
+            self.hub.warn(str(exc))
+            return
+        self.render_matches(rows)
         if not rows:
             self.hub.warn(f"No matches for {q!r}")
+
+    def render_matches(self, rows) -> None:
+        t = self.query_one(DataTable)
+        selected = str(t.coordinate_to_cell_key(t.cursor_coordinate).row_key.value) if t.row_count else None
+        t.clear(columns=True)
+        t.add_columns("Symbol", "Name", "Type", "Source")
+        for i, (symbol, name, kind, source) in enumerate(rows):
+            t.add_row(Text(symbol, style="bold"), Text(name[:80]), Text(kind, style=DIM), source, key=symbol)
+            if symbol == selected:
+                t.move_cursor(row=i)
 
     def on_data_table_row_selected(self, e: DataTable.RowSelected) -> None:
         self.app.run_command(e.row_key.value)

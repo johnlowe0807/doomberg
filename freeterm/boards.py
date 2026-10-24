@@ -2,17 +2,20 @@
 from __future__ import annotations
 
 import asyncio
+import time
+from dataclasses import asdict
 
 import pandas as pd
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import DataTable, Static
 from textual_plotext import PlotextPlot
 
 from .app import DIM, WARN, VIEWS, View, MonView, PromptScreen, fbig, fnum, colored, tag_text
 from .charts import QuoteChartView, fred, PALETTE
-from .data import RateLimiter
+from .data import Quote, RateLimiter, _sub
 
 BOARDS = {
     "WEI": [("^GSPC", "S&P 500"), ("^DJI", "Dow Jones"), ("^IXIC", "Nasdaq Comp"), ("^RUT", "Russell 2000"),
@@ -22,7 +25,10 @@ BOARDS = {
     "CMDTY": [("CL=F", "WTI Crude"), ("BZ=F", "Brent"), ("NG=F", "Nat Gas"), ("RB=F", "RBOB Gas"), ("HO=F", "Heating Oil"),
               ("GC=F", "Gold"), ("SI=F", "Silver"), ("HG=F", "Copper"), ("PL=F", "Platinum"), ("PA=F", "Palladium"),
               ("ZC=F", "Corn"), ("ZW=F", "Wheat"), ("ZS=F", "Soybeans"), ("KC=F", "Coffee"), ("SB=F", "Sugar"),
-              ("CC=F", "Cocoa"), ("CT=F", "Cotton"), ("LE=F", "Live Cattle")],
+              ("CC=F", "Cocoa"), ("CT=F", "Cotton"), ("LE=F", "Live Cattle"),
+              ("ALI=F", "Aluminum"), ("LBR=F", "Lumber"), ("KE=F", "KC HRW Wheat"), ("ZO=F", "Oats"),
+              ("ZR=F", "Rough Rice"), ("ZM=F", "Soybean Meal"), ("ZL=F", "Soybean Oil"),
+              ("GF=F", "Feeder Cattle"), ("HE=F", "Lean Hogs"), ("OJ=F", "Orange Juice")],
     "CRYPTO": [(f"{c}-USD", c) for c in ("BTC", "ETH", "SOL", "XRP", "BNB", "DOGE", "ADA", "AVAX", "LINK", "LTC", "DOT", "BCH")],
     "FXL": [("EURUSD=X", "EUR/USD"), ("GBPUSD=X", "GBP/USD"), ("JPY=X", "USD/JPY"), ("CHF=X", "USD/CHF"),
             ("AUDUSD=X", "AUD/USD"), ("CAD=X", "USD/CAD"), ("NZDUSD=X", "NZD/USD"), ("CNY=X", "USD/CNY"),
@@ -39,6 +45,7 @@ class QuoteBoard(View):
     hints = "Enter open  Ctrl+R refresh"
     refresh_secs = 15
     board = "WEI"
+    volume_label = "Volume"
 
     def compose(self) -> ComposeResult:
         yield DataTable(cursor_type="row")
@@ -46,13 +53,16 @@ class QuoteBoard(View):
     def on_mount(self) -> None:
         self.rows = BOARDS[self.board]
         t = self.query_one(DataTable)
-        for c in ("Name", "Ticker", "Last", "Chg", "%Chg", "Volume", "Day Range", "Src"):
+        for c in ("Name", "Ticker", "Last", "Chg", "%Chg", self.volume_label, "Day Range", "Src"):
             t.add_column(c)
         self.render_rows(self.hub.cached_quotes([s for s, _ in self.rows]))
         super().on_mount()
 
     def ordered(self, qs):
         return self.rows
+
+    def volume_text(self, symbol, quote):
+        return fbig(quote.volume)
 
     def render_rows(self, qs) -> None:
         t = self.query_one(DataTable)
@@ -65,7 +75,7 @@ class QuoteBoard(View):
                 continue
             t.add_row(Text(name, style="bold"), Text(s, style=DIM), Text(fnum(q.price), justify="right"),
                       colored(q.change, fnum(q.change)), colored(q.pct, fnum(q.pct) + "%"),
-                      Text(fbig(q.volume), justify="right"), f"{fnum(q.day_low)}-{fnum(q.day_high)}", tag_text(q), key=s)
+                      Text(self.volume_text(s, q), justify="right"), f"{fnum(q.day_low)}-{fnum(q.day_high)}", tag_text(q), key=s)
         if cur and t.row_count:
             t.move_cursor(row=min(cur, t.row_count - 1))
 
@@ -78,6 +88,78 @@ class QuoteBoard(View):
 
 class CmdtyBoard(QuoteBoard):
     FUNC = board = "CMDTY"
+    refresh_secs = 300
+    volume_label = "Prior volume (date)"
+    hints = "Prior-day contract volume ↓ (before today's NY date)  5m refresh  Enter open  Ctrl+R refresh"
+    LIMIT = 50
+
+    @property
+    def title(self):
+        return "CMDTY prior-day volume (50 max, curated futures)"
+
+    def on_mount(self):
+        self.snapshot_key = "cmdty-daily:" + ",".join(s for s, _ in BOARDS[self.board])
+        snapshot = self.hub.disk.get(self.snapshot_key) or {}
+        cache_key = f"{self.snapshot_key}:{pd.Timestamp.now(tz='America/New_York').date()}"
+        fetched = min((q["fetched"] for q in snapshot.get("quotes", {}).values()), default=0)
+        remaining = self.refresh_secs - (time.time() - fetched)
+        if remaining > 0 and self.hub.mem.get(cache_key) is None:
+            self.hub.mem.put(cache_key, snapshot, remaining)
+        self.volumes = snapshot.get("volumes", {})
+        super().on_mount()
+        if snapshot:
+            self.render_rows({s: Quote(**q) for s, q in snapshot.get("quotes", {}).items()})
+
+    def ordered(self, qs):
+        def rank(row):
+            volume = self.volumes.get(row[0], {}).get("volume")
+            return (volume is None, -(volume or 0), row[0])
+        return sorted(self.rows, key=rank)[:self.LIMIT]
+
+    def volume_text(self, symbol, quote):
+        entry = self.volumes.get(symbol, {})
+        date = entry.get("date", "")
+        return f"{fbig(entry.get('volume'))} {date}".strip()
+
+    async def load(self):
+        symbols = [s for s, _ in self.rows][:self.LIMIT]
+        today = pd.Timestamp.now(tz="America/New_York").date()
+
+        def download():
+            import yfinance as yf
+            # Daily bars supply both quotes and ranking: no extra intraday requests.
+            frame = yf.download(symbols, period="5d", interval="1d", group_by="ticker",
+                                auto_adjust=False, progress=False, threads=False)
+            snapshot = {"quotes": {}, "volumes": {}}
+            for symbol in symbols:
+                bars = _sub(frame, symbol)
+                if bars is None or "Close" not in bars:
+                    continue
+                bars = bars.dropna(subset=["Close"])
+                if bars.empty:
+                    continue
+                last = bars.iloc[-1]
+                number = lambda v: float(v) if pd.notna(v) else None
+                quote = Quote(symbol, price=number(last["Close"]),
+                              prev_close=number(bars.iloc[-2]["Close"]) if len(bars) > 1 else None,
+                              volume=number(last.get("Volume")), day_low=number(last.get("Low")),
+                              day_high=number(last.get("High")), ts=bars.index[-1].timestamp(), fetched=time.time())
+                snapshot["quotes"][symbol] = asdict(quote)
+                prior = bars[bars.index.date < today]
+                if not prior.empty and "Volume" in prior:
+                    snapshot["volumes"][symbol] = {
+                        "volume": number(prior.iloc[-1]["Volume"]), "date": str(prior.index[-1].date())}
+            return snapshot if snapshot["quotes"] else None
+
+        # Share the five-minute cache; Ctrl+R clears memory to request a fresh batch.
+        snapshot = await self.hub.yf_call(f"{self.snapshot_key}:{today}", self.refresh_secs, download)
+        if snapshot:
+            self.hub.disk.put(self.snapshot_key, snapshot)
+        if snapshot:
+            self.volumes = snapshot["volumes"]
+            self.render_rows({s: Quote(**q) for s, q in snapshot["quotes"].items()})
+        else:
+            self.hub.warn("CMDTY: daily data unavailable; retaining cached rows")
 
 
 class CryptoBoard(QuoteBoard):
@@ -242,7 +324,8 @@ class GCView(View):
 
 class BTMMView(View):
     FUNC = "BTMM"
-    hints = "Rates & money markets. FRED = daily close; ^IRX/^FVX/^TNX/^TYX = intraday proxies (DLY)"
+    BINDINGS = [Binding("[", "section(-1)", show=False), Binding("]", "section(1)", show=False)]
+    hints = "[ ] switch rates / ETFs  FRED = daily close; ^IRX/^FVX/^TNX/^TYX = intraday proxies (DLY)"
     refresh_secs = 30
     FRED_ROWS = [(n, s) for n, s in TENORS] + [("Fed Funds", "DFF"), ("SOFR", "SOFR"), ("10Y TIPS real", "DFII10"),
                                                ("Mortgage 30Y", "MORTGAGE30US")]
