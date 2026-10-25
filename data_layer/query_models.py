@@ -153,5 +153,77 @@ class ComparisonQuery:
     mode: str = 'NORMALIZED'
 
 
+@dataclass(frozen=True)
+class Condition:
+    field: str
+    operator: str
+    value: Any = None
+
+
+@dataclass(frozen=True)
+class BooleanExpression:
+    operator: str
+    children: tuple[Condition | BooleanExpression, ...]
+
+
+@dataclass(frozen=True)
+class SortOrder:
+    field: str
+    descending: bool = False
+
+
+@dataclass(frozen=True)
+class TableQuery:
+    """Universal selection request; no terminal syntax or provider expressions required."""
+    dataset: str
+    where: Condition | BooleanExpression | None = None
+    search: tuple[str, ...] = ()
+    sort: tuple[SortOrder, ...] = ()
+    fields: tuple[str, ...] = ()
+    limit: int = 50
+    parameters: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class FundamentalsQuery:
+    symbol: str
+    source: Literal['yahoo', 'sec'] = 'yahoo'
+    as_of: str | None = None  # SEC filing-date cutoff, inclusive; Yahoo snapshots are current only
+
+
+@dataclass(frozen=True)
+class EstimatesQuery:
+    symbol: str
+
+
+@dataclass(frozen=True)
+class HoldingsQuery:
+    symbol: str
+
+
+@dataclass(frozen=True)
+class TableBatch:
+    rows: tuple[dict[str, Any], ...]
+    universe: str
+    expected: int
+    complete: bool = True
+
+
+@dataclass(frozen=True)
+class TableData:
+    rows: tuple[dict[str, Any], ...]
+    fields: tuple[str, ...]
+    universe: str
+    total: int
+    available: int
+    matched: int
+    complete: bool
+    missing: dict[str, int]
+    execution: str = 'local'
+    ranking_complete: bool | None = None
+    matched_exact: bool = True
+
+
 Query = (HistoryQuery | SeriesQuery | QuotesQuery | ResourceQuery | FactsQuery | FilingsQuery | NewsQuery |
-         SearchQuery | BarsQuery | StoredBarsQuery | TextQuery | ComparisonQuery)
+         SearchQuery | BarsQuery | StoredBarsQuery | TextQuery | ComparisonQuery | TableQuery |
+         FundamentalsQuery | EstimatesQuery | HoldingsQuery)

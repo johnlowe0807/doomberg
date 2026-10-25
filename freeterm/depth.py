@@ -52,7 +52,7 @@ def fmt_info(k, v) -> str:
 
 class DesView(View):
     FUNC = "DES"
-    hints = "Company profile (yfinance .info, unofficial)  /GP chart  /FA financials  /ERN earnings"
+    hints = "Company profile (Yahoo quoteSummary, unofficial)  /GP chart  /FA financials  /ERN earnings"
 
     def compose(self) -> ComposeResult:
         yield DataTable(cursor_type="row", show_header=False)

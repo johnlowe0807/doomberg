@@ -21,147 +21,217 @@ from data_layer.catalog import BOARDS, TAPE
 
 
 class QuoteBoard(View):
-    FUNC = "WEI"
-    hints = "Enter open  Ctrl+R refresh"
+    """Thin table client; all selection and ordering run through TableQuery."""
+    FUNC = "INDEX"
+    board = "index"
+    view_commands_enabled = table_commands_enabled = True
+    hints = ". commands  ? fields/help  Enter graph  Ctrl+R refresh"
     refresh_secs = 15
-    board = "WEI"
-    volume_label = "Volume"
+    DEFAULT_CSS = 'QuoteBoard > #info { height: auto; max-height: 3; } QuoteBoard > #query-settings { height: auto; max-height: 3; color: #FF5FD2; }'
 
-    def compose(self) -> ComposeResult:
-        yield DataTable(cursor_type="row")
-
-    def on_mount(self) -> None:
-        self.rows = BOARDS[self.board]
-        t = self.query_one(DataTable)
-        for c in ("Name", "Ticker", "Last", "Chg", "%Chg", self.volume_label, "Day Range", "Src"):
-            t.add_column(c)
-        self.render_rows(self.hub.cached_quotes([s for s, _ in self.rows]))
-        super().on_mount()
-
-    def ordered(self, qs):
-        return self.rows
-
-    def volume_text(self, symbol, quote):
-        return fbig(quote.volume)
-
-    def render_rows(self, qs) -> None:
-        t = self.query_one(DataTable)
-        cur = t.cursor_row
-        t.clear()
-        for s, name in self.ordered(qs):
-            q = qs.get(s)
-            if not q:
-                t.add_row(name, s, *["N/A"] * 6, key=s)
-                continue
-            t.add_row(Text(name, style="bold"), Text(s, style=DIM), Text(fnum(q.price), justify="right"),
-                      colored(q.change, fnum(q.change)), colored(q.pct, fnum(q.pct) + "%"),
-                      Text(self.volume_text(s, q), justify="right"), f"{fnum(q.day_low)}-{fnum(q.day_high)}", tag_text(q), key=s)
-        if cur and t.row_count:
-            t.move_cursor(row=min(cur, t.row_count - 1))
-
-    async def load(self) -> None:
-        self.render_rows(await self.hub.quotes([s for s, _ in self.rows]))
-
-    def on_data_table_row_selected(self, e: DataTable.RowSelected) -> None:
-        self.app.run_command(e.row_key.value)
-
-
-class CmdtyBoard(QuoteBoard):
-    FUNC = board = "CMDTY"
-    refresh_secs = 300
-    volume_label = "Prior volume (date)"
-    hints = "Prior-day contract volume ↓ (before today's NY date)  5m refresh  Enter open  Ctrl+R refresh"
-    LIMIT = 50
+    def __init__(self, hub, sec, args):
+        super().__init__(hub, sec, args)
+        from data_layer.query_models import TableQuery
+        self.table_query = TableQuery(self.board)
+        self.command_history = []
+        self.result = None
 
     @property
-    def title(self):
-        return "CMDTY prior-day volume (50 max, curated futures)"
+    def dataset(self):
+        return self.hub.queries.table_dataset(self.table_query.dataset)
 
-    def on_mount(self):
-        self.volumes = {}
-        super().on_mount()
+    def compose(self) -> ComposeResult:
+        yield Static("Querying market universe…", id="info", markup=False)
+        yield Static('', id='query-settings', markup=False)
+        yield DataTable(cursor_type="row")
 
-    def ordered(self, qs):
-        def rank(row):
-            volume = self.volumes.get(row[0], {}).get("volume")
-            return (volume is None, -(volume or 0), row[0])
-        return sorted(self.rows[:self.LIMIT], key=rank)
+    def execute_graph_command(self, line):
+        from .screen_commands import execute
+        return execute(self, line)
 
-    def volume_text(self, symbol, quote):
-        entry = self.volumes.get(symbol, {})
-        date = entry.get("date", "")
-        return f"{fbig(entry.get('volume'))} {date}".strip()
+    def open_graph_commands(self):
+        from .graph_commands import GraphCommandScreen
+        self.app.push_screen(GraphCommandScreen(self))
+
+    def render_result(self, result):
+        from data_layer.query_language import format_query
+        self.result = result
+        self.query_one('#query-settings', Static).update(format_query(self.table_query))
+        table = self.query_one(DataTable)
+        selected = None
+        if table.row_count:
+            selected = table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+        table.clear(columns=True)
+        self.navigation = []
+        if result.data is None:
+            self.query_one("#info", Static).update("N/A · " + result.meta.reason)
+            return
+        data = result.data
+        for field in data.fields:
+            table.add_column(self.dataset.fields[field].title or field, key=field)
+        for i, row in enumerate(data.rows):
+            cells = []
+            for field in data.fields:
+                value = row.get(field)
+                if self.dataset.fields[field].kind == 'number':
+                    spec = self.dataset.fields[field]
+                    unit = row.get('unit') if field == 'value' else spec.unit
+                    text = fbig(value) if field in ('volume', 'market_cap') or unit in ('currency','shares') else fnum(value)
+                    if unit == 'percent' or field == 'pct_change':
+                        text += '%'
+                    cells.append(colored(value, text) if field in ('change', 'pct_change') else Text(text, justify='right'))
+                else:
+                    cells.append(Text('N/A' if value is None else str(value), style=WARN if value == 'STALE' else ''))
+            table.add_row(*cells, key=str(i))
+        # Navigation identifiers are supplied separately from the user's projected fields.
+        self.navigation = self._navigation
+        if selected is not None and table.row_count:
+            table.move_cursor(row=min(int(selected), table.row_count - 1))
+        coverage = ('market-ranked' if data.ranking_complete else 'PARTIAL ranking') if data.execution == 'yahoo' else ('complete listed universe' if data.complete else 'PARTIAL coverage')
+        missing = ', '.join(f'{field}:{count}' for field, count in data.missing.items()) or 'none'
+        counts = (f"{len(data.rows)} shown / {'' if data.matched_exact else 'at least '}{data.matched} matched / {data.available} fetched of {data.total} candidates"
+                  if data.execution == 'yahoo' else f"{len(data.rows)} shown / {data.matched} matched / {data.total} listed")
+        self.query_one("#info", Static).update(
+            f"{data.universe} · {coverage} · {counts}"
+            f" · {result.meta.source} {result.meta.freshness.upper()} · missing {missing}"
+            + (f"\n{result.meta.reason}" if result.meta.reason else ''))
+        if getattr(self.parent, 'id', None) == 'home-movers':
+            self.parent.query_one('#home-movers-label', Static).update(self.title)
 
     async def load(self):
-        symbols = [s for s, _ in self.rows][:self.LIMIT]
-        today = pd.Timestamp.now(tz="America/New_York").date()
-
-        snapshot = await self.hub.resource("yf", "commodity", symbols=tuple(symbols), date=str(today))
-        if snapshot:
-            self.volumes = snapshot["volumes"]
-            self.render_rows({s: Quote(**q) for s, q in snapshot["quotes"].items()})
+        # Always retain the identifier for Enter, even if FIELDS omits its display.
+        from dataclasses import replace
+        request = self.table_query
+        fields = request.fields or self.dataset.defaults
+        result = await self.hub.query(replace(request, fields=tuple(dict.fromkeys((*fields, 'symbol')))))
+        if request != self.table_query:
+            return
+        if result.data is not None:
+            self._navigation = [row['symbol'] for row in result.data.rows]
+            projected = tuple({field: row.get(field) for field in fields} for row in result.data.rows)
+            result = replace(result, data=replace(result.data, rows=projected, fields=fields))
         else:
-            self.hub.warn("CMDTY: daily data unavailable; retaining cached rows")
+            self._navigation = []
+        self.render_result(result)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        from shlex import quote
+        index = int(event.row_key.value)
+        if index < len(getattr(self, 'navigation', ())):
+            self.app.run_command('/GP _symbol=' + quote(self.navigation[index]))
+
+
+class FuturesBoard(QuoteBoard):
+    FUNC, board = "FUTURES", "futures"
+    refresh_secs = 300
+
+    def __init__(self, hub, sec, args):
+        super().__init__(hub, sec, args)
+        from dataclasses import replace
+        from data_layer.query_models import SortOrder
+        self.table_query = replace(self.table_query, sort=(SortOrder('volume', True),))
 
 
 class CryptoBoard(QuoteBoard):
-    FUNC = board = "CRYPTO"
-    hints = "Enter open  Coinbase live where available; Yahoo fallback"
+    FUNC, board = "CRYPTO", "crypto"
+
+
+class EquityBoard(QuoteBoard):
+    FUNC, board = "EQUITY", "equity"
+
+
+class EtfBoard(QuoteBoard):
+    FUNC, board = "ETF", "etf"
+
+
+class FxBoard(QuoteBoard):
+    FUNC, board = "FX", "fx"
+
+
+class FundBoard(QuoteBoard):
+    FUNC, board = "FUND", "fund"
+    refresh_secs = 300
+
+
+class BondBoard(QuoteBoard):
+    FUNC, board = "ETF", "etf"
+
+    def __init__(self, hub, sec, args):
+        super().__init__(hub, sec, args)
+        from dataclasses import replace
+        from data_layer.query_models import Condition
+        from data_layer.yahoo_screening import bond_categories
+        self.table_query = replace(self.table_query, where=Condition('category', 'IN', bond_categories()))
+
+
+class FinancialTableView(QuoteBoard):
+    refresh_secs = None
+
+    @property
+    def title(self):
+        title = f'{self.sec or ""} {self.FUNC}'.strip()
+        request = getattr(self,'table_query',None)
+        parameters = request.parameters if request else {}
+        if parameters.get('source') == 'sec':
+            title += ' SEC' + (' filed ≤ ' + parameters['as_of'] if parameters.get('as_of') else '')
+        return title
+
+    def __init__(self, hub, sec, args):
+        super().__init__(hub, sec, args)
+        from dataclasses import replace
+        from data_layer.financial_data import validate_table
+        parameters = {'symbol':sec}
+        if self.board == 'fundamentals':
+            if len(args) > 2 or (args and args[0].upper() not in ('YF','YAHOO','SEC')):
+                raise ValueError('Use /METRICS ticker [SEC [YYYY-MM-DD]]; dot commands filter/sort the result')
+            parameters['source'] = 'sec' if args and args[0].upper() == 'SEC' else 'yahoo'
+            if len(args) == 2:
+                parameters['as_of'] = args[1]
+        elif args:
+            raise ValueError(f'Use /{self.FUNC} ticker, followed by dot query commands')
+        self.table_query = replace(self.table_query,parameters=parameters)
+        validate_table(self.table_query,self.dataset)
+
+
+class MetricsView(FinancialTableView):
+    FUNC, board = 'METRICS', 'fundamentals'
+
+
+class EstimatesView(FinancialTableView):
+    FUNC, board = 'EST', 'estimates'
+
+
+class AnalystView(FinancialTableView):
+    FUNC, board = 'ANALYST', 'analysts'
+
+
+class HoldingsView(FinancialTableView):
+    FUNC, board = 'HOLD', 'holdings'
 
 
 class MostBoard(QuoteBoard):
-    """Yahoo screeners with a liquid large-cap fallback when screening is unavailable."""
-    FUNC, board = "MOST", "MOSTU"
-    hints = "s cycle gainers/losers/active  Enter open"
-    modes = ["gainers", "losers", "active"]
+    FUNC, board = "EQUITY", "equity"
+    hints = "s gainers/losers/active  . commands  ? fields/help  Enter graph"
+    modes = ('gainers', 'losers', 'active')
 
-    def on_mount(self) -> None:
+    def __init__(self, hub, sec, args):
+        super().__init__(hub, sec, args)
         self.m = 0
-        self.screened = False
-        super().on_mount()
-
-    async def load(self) -> None:
-        mode = self.modes[self.m]
-        query = {"gainers": "day_gainers", "losers": "day_losers", "active": "most_actives"}[mode]
-        data = await self.hub.resource("yf", "screen", screen=query)
-        quotes, rows = {}, []
-        for item in (data or {}).get("quotes", []):
-            symbol, price = item.get("symbol"), item.get("regularMarketPrice")
-            if not symbol or price is None or symbol in quotes:
-                continue
-            previous = item.get("regularMarketPreviousClose")
-            if previous is None and item.get("regularMarketChange") is not None:
-                previous = price - item["regularMarketChange"]
-            quotes[symbol] = Quote(symbol, price=price, prev_close=previous,
-                                   volume=item.get("regularMarketVolume"), day_low=item.get("regularMarketDayLow"),
-                                   day_high=item.get("regularMarketDayHigh"), ts=item.get("regularMarketTime"),
-                                   fetched=time.time())
-            rows.append((symbol, item.get("longName") or item.get("shortName") or symbol))
-        if mode != self.modes[self.m]:
-            return
-        self.screened = bool(rows)
-        self.rows = rows or BOARDS[self.board]
-        if not rows:
-            quotes = await self.hub.quotes([s for s, _ in self.rows])
-        self.render_rows(quotes)
-        self.retitle()
-        if isinstance(self.parent, Vertical) and self.parent.id == "home-movers":
-            self.parent.query_one("#home-movers-label", Static).update(self.title)
-
-    def ordered(self, qs):
-        have = [r for r in self.rows if r[0] in qs and qs[r[0]].pct is not None]
-        key = {"gainers": lambda r: -qs[r[0]].pct, "losers": lambda r: qs[r[0]].pct,
-               "active": lambda r: -(qs[r[0]].volume or 0)}[self.modes[self.m]]
-        return sorted(have, key=key)
+        self.set_mode()
 
     @property
-    def title(self) -> str:
-        source = "Yahoo screener" if getattr(self, "screened", False) else "large-cap fallback"
-        return f"MOST {self.modes[getattr(self, 'm', 0)]} ({source})"
+    def title(self):
+        return 'EQUITY ' + self.modes[self.m]
 
-    def key_s(self) -> None:
-        self.m = (self.m + 1) % 3
-        self.screened = False
+    def set_mode(self):
+        from dataclasses import replace
+        from data_layer.query_models import SortOrder, Condition
+        field, descending = ('volume', True) if self.m == 2 else ('pct_change', self.m == 0)
+        self.table_query = replace(self.table_query, where=None if self.m == 2 else Condition('pct_change', '>' if self.m == 0 else '<', 0), sort=(SortOrder(field, descending),))
+
+    def key_s(self):
+        self.m = (self.m + 1) % len(self.modes)
+        self.set_mode()
         self.retitle()
         self.reload()
 
@@ -406,5 +476,6 @@ class IexView(View):
         self.query_one(Static).update(Text(msg, style=WARN))
 
 
-VIEWS.update({"WEI": QuoteBoard, "CMDTY": CmdtyBoard, "CRYPTO": CryptoBoard, "MOST": MostBoard, "FXC": FxcView,
-              "HOME": HomeView, "GC": GCView, "BTMM": BTMMView, "AUCT": AuctView, "IEX": IexView})
+VIEWS.update({"WEI": QuoteBoard, "INDEX": QuoteBoard, "EQUITY": EquityBoard, "ETF": EtfBoard, "FX": FxBoard, "FUND": FundBoard, "BONDS": BondBoard, "FUTURES": FuturesBoard, "CMDTY": FuturesBoard, "CRYPTO": CryptoBoard, "MOST": MostBoard, "FXC": FxcView,
+              "HOME": HomeView, "GC": GCView, "BTMM": BTMMView, "AUCT": AuctView, "IEX": IexView,
+              'METRICS':MetricsView,'EST':EstimatesView,'ANALYST':AnalystView,'HOLD':HoldingsView})

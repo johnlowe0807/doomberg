@@ -16,7 +16,8 @@ import pandas as pd
 from .ingestion import Ingestion
 from .normalization import fred_series, norm_yf_news, rss_items
 from .query_models import (ComparisonQuery, BarsQuery, StoredBarsQuery, TextQuery, AnalysisQuery, FactsQuery, FilingsQuery, HistoryQuery, Metadata,
-                           NewsQuery, Query, QuotesQuery, ResourceQuery, Result, SearchQuery, SeriesQuery)
+                           NewsQuery, Query, QuotesQuery, ResourceQuery, Result, SearchQuery, SeriesQuery, TableQuery, TableData,
+                           FundamentalsQuery, EstimatesQuery, HoldingsQuery)
 from .serialization import key
 from .storage import Repository, ResultCache
 
@@ -29,6 +30,8 @@ POLICIES = {
     'profile': (3600, 60), 'book': (15, 5), 'chain': (30, 15), 'expiries': (300, 30),
     'earnings': (3600, 60), 'calendar': (3600, 60), 'financials': (3600, 60),
     'news': (300, 30), 'screen': (300, 30), 'search': (600, 60), 'names': (86400, 60),
+    'market-screen': (300, 300),
+    'fundamental-data': (21600, 21600), 'estimate-data': (3600, 3600), 'holdings-data': (86400, 86400),
     'commodity': (300, 60), 'secfacts': (86400, 60), 'secsub': (86400, 60),
     'secdocs': (365 * 86400, 60), 'secidx': (365 * 86400, 60), 'sec': (7 * 86400, 60),
     'rss': (300, 30), 'fred-search': (86400, 60), 'fred-meta': (86400, 60),
@@ -38,6 +41,7 @@ POLICIES = {
 
 class QueryService:
     def __init__(self, home: Path, ingestion: Ingestion, warn: Callable[[str], None]):
+        self.home = home
         self.repository = Repository(home / 'data' / 'observations.sqlite3')
         self.cache = ResultCache(home / 'cache' / 'pipeline.sqlite3')
         self.ingestion, self.warn = ingestion, warn
@@ -49,11 +53,30 @@ class QueryService:
         self.invalidated = {}
         self.last_cleanup = 0
         self.closing = False
+        self.tables = {}
+        from .screening import register
+        register(self)
+        from .financial_data import register as register_financial
+        register_financial(self)
+
+    def register_table(self, name, dataset):
+        """Register a dataset adapter once; all clients share the same query semantics."""
+        if not name or name.casefold() in self.tables:
+            raise ValueError('Dataset name is empty or already registered: ' + name)
+        self.tables[name.casefold()] = dataset
+
+    def table_dataset(self, name):
+        try:
+            return self.tables[name.casefold()]
+        except KeyError:
+            raise ValueError('Unknown dataset ' + name + '; available: ' + ', '.join(self.tables)) from None
 
     async def initialize(self):
         async with self.init_lock:
             if self.ready:
                 return
+            if hasattr(self.ingestion, 'initialize_yahoo'):
+                await asyncio.to_thread(self.ingestion.initialize_yahoo, self.home / 'cache' / 'yahoo')
             try:
                 await asyncio.to_thread(self.repository.initialize)
             except Exception as error:
@@ -199,10 +222,24 @@ class QueryService:
                     stored_only: bool = False) -> Result[str | None]: ...
 
     @overload
+    async def query(self, query: FundamentalsQuery | EstimatesQuery | HoldingsQuery, *, force: bool = False,
+                    stored_only: bool = False) -> Result[list | None]: ...
+
+    @overload
+    async def query(self, query: TableQuery, *, force: bool = False,
+                    stored_only: bool = False) -> Result[TableData | None]: ...
+
+    @overload
     async def query(self, query: ResourceQuery, *, force: bool = False,
                     stored_only: bool = False) -> Result[Any]: ...
 
     async def query(self, query: Query, *, force: bool = False, stored_only: bool = False) -> Result[Any]:
+        if isinstance(query, (FundamentalsQuery, EstimatesQuery, HoldingsQuery)):
+            from .financial_data import snapshot
+            return await snapshot(self, query, force=force, stored_only=stored_only)
+        if isinstance(query, TableQuery):
+            from .tabular import execute
+            return await execute(self, query, force=force, stored_only=stored_only)
         if isinstance(query, ComparisonQuery):
             return await self.comparison(query, force=force, stored_only=stored_only)
         if isinstance(query, StoredBarsQuery):
@@ -350,7 +387,8 @@ class QueryService:
             hit = await asyncio.to_thread(self.repository.get, 'quote:' + symbol)
             if hit:
                 old[symbol] = hit
-            if not stored_only and (force or not hit or hit[1].fetched_at < self.cutoff or time.time() - hit[1].fetched_at >= 5):
+            ttl = 30 if hit and hit[0].get('live') else 5
+            if not stored_only and (force or not hit or hit[1].fetched_at < self.cutoff or time.time() - hit[1].fetched_at >= ttl):
                 need.append(symbol)
         # Identical concurrent batches share one rate-limited request.
         if need:
@@ -380,11 +418,13 @@ class QueryService:
         for symbol in symbols:
             if symbol in old:
                 value, meta = old[symbol]
-                if time.time() - meta.fetched_at >= 5 or meta.fetched_at < self.cutoff:
+                ttl = 30 if value.get('live') else 5
+                if time.time() - meta.fetched_at >= ttl or meta.fetched_at < self.cutoff:
                     meta = replace(meta, freshness='stale', reason='Quote refresh unavailable; stored snapshot')
                 values[symbol] = dict(value, stale=meta.freshness != 'fresh')
                 metadata.append(meta)
-        meta = self.combine(metadata, 'yf') if metadata else Metadata('yf', reason='No quote data')
+        sources = '|'.join(dict.fromkeys(m.source for m in metadata))
+        meta = self.combine(metadata, sources) if metadata else Metadata('yf', reason='No quote data')
         return Result(values, meta, tuple(metadata))
 
     async def news(self, query, *, force=False, stored_only=False):

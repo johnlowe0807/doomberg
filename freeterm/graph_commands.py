@@ -38,6 +38,9 @@ HELP = (
 
 
 def available_verbs(chart):
+    if getattr(chart, 'table_commands_enabled', False):
+        from .screen_commands import VERBS as TABLE_VERBS
+        return TABLE_VERBS
     if getattr(chart, 'view_commands_enabled', False):
         from .option_commands import VERBS as OPTIONS_VERBS, ALIASES
         return (*OPTIONS_VERBS, *ALIASES)
@@ -62,6 +65,9 @@ def available_indicators(chart):
 
 
 def graph_help(chart):
+    if getattr(chart, 'table_commands_enabled', False):
+        from .screen_commands import help_text
+        return help_text(chart)
     if getattr(chart, 'view_commands_enabled', False):
         from .option_commands import help_text
         return help_text(chart)
@@ -158,6 +164,9 @@ def command_starts(words):
 
 def execute(chart, line):
     """Run graph commands in input order; stop at the first failure, retaining earlier changes."""
+    if getattr(chart, 'table_commands_enabled', False):
+        from .screen_commands import execute as execute_table
+        return execute_table(chart, line)
     if getattr(chart, 'view_commands_enabled', False):
         from .option_commands import execute as execute_options
         return execute_options(chart, line)
@@ -376,7 +385,7 @@ class GraphHelpScreen(ModalScreen):
     def __init__(self, chart):
         super().__init__()
         self.help_text = graph_help(chart)
-        self.label = 'Options commands' if getattr(chart, 'view_commands_enabled', False) else 'Graph commands'
+        self.label = 'Screening commands' if getattr(chart, 'table_commands_enabled', False) else 'Options commands' if getattr(chart, 'view_commands_enabled', False) else 'Graph commands'
 
     def compose(self):
         with VerticalScroll():
@@ -408,7 +417,8 @@ class GraphCommandScreen(ModalScreen):
 
     def compose(self):
         with Vertical():
-            yield Static(f"{'Options' if getattr(self.chart, 'view_commands_enabled', False) else 'Graph'} commands · {self.chart.title}")
+            kind = 'Screening' if getattr(self.chart, 'table_commands_enabled', False) else 'Options' if getattr(self.chart, 'view_commands_enabled', False) else 'Graph'
+            yield Static(f"{kind} commands · {self.chart.title}")
             yield Input(placeholder="Enter a view command", id="graph-command", select_on_focus=False, compact=True)
             yield Static("HELP or ? for commands · Enter apply · Tab complete · Esc cancel", markup=False)
             yield Static("", id="graph-error", markup=False)
@@ -446,7 +456,10 @@ class GraphCommandScreen(ModalScreen):
             stem_prefix = entry.value.rpartition(' ')[0] + ' '
         choices = [stem_prefix + prefix + verb for verb in (*available_verbs(self.chart), "HELP", "?")]
         current = head.split()[-1].lstrip('./') if head.split() else ''
-        if getattr(self.chart, 'view_commands_enabled', False):
+        if getattr(self.chart, 'table_commands_enabled', False):
+            choices += [stem_prefix + name for name in self.chart.dataset.fields]
+            choices += [stem_prefix + word for word in ('ASC', 'DESC', 'AND', 'OR', 'NOT', 'NULL', 'IS', 'IN', 'LIKE', 'CONTAINS')]
+        elif getattr(self.chart, 'view_commands_enabled', False):
             from data_layer.windows import RANGES
             values = {'EXP': ['NEXT', 'PREV', 'FIRST', 'LAST', 'LIST', *self.chart.expiries],
                       'EXPIRY': ['NEXT', 'PREV', 'FIRST', 'LAST', 'LIST', *self.chart.expiries],

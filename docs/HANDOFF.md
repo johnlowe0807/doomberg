@@ -93,6 +93,45 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
   `BadVol`. The chart then says "N bad Yahoo volume prints hidden". Don't apply it to 5m (clean) or crypto (false positives).
 
 ## Query and storage contracts
+- `TableQuery(dataset, where, search, sort, fields, limit, parameters)` is the shared tabular API. `register_table(name, Dataset(...))`
+  registers typed fields, defaults, search columns and an async loader or provider executor/validator; derived `Field` calculations declare dependencies
+  and execute in workers. `tabular.py` owns validation, SQL three-valued predicates, nulls-last stable sorting and final
+  projection/limits. `query_language.py` only translates text to typed requests; clients can bypass it. `TableData` reports
+  universe, coverage, matched counts and missing fields; provider metadata and offline/refresh behavior are preserved.
+- `financial_fields.py` defines 41 canonical metric names/units/periods; `financial_data.py` handles typed
+  `FundamentalsQuery(symbol, source='yahoo'|'sec', as_of=None)`, `EstimatesQuery(symbol)` and `HoldingsQuery(symbol)`.
+  Grouped Yahoo requests feed normalized persistent records, shared by clients and bounded financial enrichment.
+  `sec_metrics.py` uses eligible filing dates, fiscal quarters/YTD differences, and annual totals at fiscal year ends;
+  mismatched periods/zero denominators remain missing. Financial percentages use percentage points, debt/equity a ratio.
+  Yahoo publication dates are not inferred from period ends; its estimates remain current snapshots. Unknown holdings
+  reporting dates remain null and reported top positions never imply full portfolio coverage.
+- Canonical client security pages are EQUITY/ETF/FUND/INDEX/FUTURES/CRYPTO/FX. CMDTY/WEI redirect to their type pages;
+  BONDS/MOST are filtered ETF/equity shortcuts. METRICS/EST/ANALYST/HOLD are per-security query tables using the same
+  dot commands and preserving security/source/date in `TableQuery.parameters`, including across CLEAR. Financial
+  lookups are capped by `[screener].max_enrich_symbols` (25 default, 100 maximum). Provider ranking is preserved when
+  quote payloads omit financial fields; local calculations evaluate covered prefixes with explicit incomplete coverage.
+- All security screeners use `screening.py` registration and `yahoo_screening.py` planning over Yahoo's screenable universe.
+  Universal predicates translate to provider fields; independent AND conditions push down, while mixed OR/NOT groups stay
+  intact. Native EquityQuery/ETFQuery/FundQuery handle those types; the ingestion adapter supplies Yahoo's wire protocol
+  for crypto/futures/FX/indices. Supported filtering/primary sorting happen before page retrieval; residual/derived fields
+  use bounded sequential scans. Secondary sorts finish the boundary tie group. Page caches are shared for five minutes,
+  independent of displayed columns. `[screener].max_pages` defaults to 8 (1–40), with at most 250 records per page.
+  `TableData.complete` indicates full retrieval; `ranking_complete` separately reports whether the requested top rows are
+  covered. `matched_exact=False` marks lower-bound local counts. Caps, failed/duplicate/short pages and changing totals
+  cannot silently imply complete coverage. Yahoo outages use stored pages or N/A; no fixed-list screener fallback remains.
+- Equities/ETFs default to US; explicit region/exchange conditions override that default. Funds default to NAS, crypto to
+  USD pairs (explicit currency overrides it). BONDS screens bond ETFs, CMDTY screens all commodity/financial futures using
+  Yahoo's reported volume; prices retain native currencies. `Ingestion.initialize_yahoo()` uses the app-owned
+  `cache/yahoo` directory before data requests, avoiding stale cookies shared by unrelated yfinance applications.
+  `yahoo_session.py` serializes Yahoo resource requests in workers: a final 401 gets at most one anonymous
+  cookie/crumb renewal per minute, then resource calls share a 60-second auth / 300-second rate cooldown.
+  Queued enrichments recheck before fetching; login cookies are preserved. Rate limits clear only crumb/response state,
+  never cookies. Chart/history remain independent; stale repository fallback stays in QueryService. Profiles/books use
+  grouped quoteSummary modules instead of `.info`'s extra requests and swallowed HTTP errors.
+  Repeated WHERE/SEARCH clauses use AND;
+  SORT/FIELDS/LIMIT replace earlier settings. Screening dot
+  chains validate atomically. Quotes protect literal dots, command words and decimals; `_symbol=` preserves explicit
+  identifiers. Board `?`, popup HOME and HELP list fields and syntax. Coinbase snapshots retain 30-second live freshness.
 - `QueryService.query()` returns `Result(data, meta, inputs)`. Metadata includes source, observation time, original fetch time,
   content version, freshness (`fresh/stale/unavailable`), cache origin and fallback reason. DataHub exposes warnings/status;
   frame adapters retain metadata in `frame.attrs['freeterm']`. Cached results never promote stale inputs to fresh.
@@ -101,8 +140,11 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
   observations across history requests with per-row `FetchedAt` and `Source`; date bounds are inclusive/exclusive UTC.
 - `data/observations.sqlite3` uses dedicated OHLCV/FRED, fact, filing, news and FTS5 tables, plus source documents for
   profiles/options/calendars and original documents. Rolling refreshes merge timestamps and retain earlier observations;
-  corrections replace matching timestamps. Market records retain their original per-row fetch times. SQLite schema v2
+  corrections replace matching timestamps. Market records retain their original per-row fetch times. SQLite schema v3
   has versioned initialization and upgrades; no pickle is used. Existing settings, aliases and watchlists retain their paths.
+  Dedicated `fundamental_metrics`, `analyst_estimates` and `fund_holdings` tables store normalized records and indexes.
+  Financial normalization keys include their logic version; offline queries can rebuild upgraded records from retained
+  source documents without ingestion. Fundamentals/estimates/holdings refresh at 6h/1h/24h, retaining original fetch times.
 - `cache/pipeline.sqlite3` is disposable. Provider responses have independent short TTLs; normalized datasets have
   per-source/type freshness policies in `query.POLICIES` (history bases retain 60/120/300/900s). Response expiry cannot
   delete observations. A failed fetch returns stored data with STALE metadata and a reason, or explicit unavailable data.
@@ -188,19 +230,67 @@ MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default 
 - [x] Slash commands and symbol separation (2026-10-23): uppercase letters and `/` focus the command line; commands use `/`, security search uses `/? apple` or `/?apple`. Updated internal navigation, autocomplete, help, startup migration, and smoke inputs. App startup/exit and the full live-data smoke test passed (search returned 9 rows); focused headless checks passed for keyboard routing, ticker/command collisions, pane cycling, modal input, help, history, autocomplete, and startup migration. Alpaca remains untested without keys.
 
 ## Open items
-- [ ] **Alpaca IEX edge cases need verification**. Live smoke authenticated and subscribed 13 symbols. Verify the
+- [ ] Bedtime backlog notes (2026-10-24), detailed in `docs/claude-prompts/features-TODO-pt2.md` §7: keep analysis/metric
+      drill-down on the selected analysis and its available history/inputs; expose futures categories for shared filtering
+      and sorting; improve visualizations for expanded datasets; normalize equivalent fields, especially dates/timestamps,
+      in data-layer adapters so query commands and sorting semantics remain consistent across providers/security types.
+      Notes only; implementation remains pending.
+- [x] Yahoo 401 recovery and field reference (2026-10-24): coordinated anonymous cookie/crumb renewal after a final
+      401, one recovery per minute, shared resource cooldowns (60s auth / 300s rate), and queued-worker checks prevent
+      enrichment failure cascades. Login cookies remain intact; charts/history remain independent. Profiles/books now
+      use one grouped quoteSummary request, preserving displayed units/exchange fields and avoiding `.info`'s extra
+      quote/timeseries requests. Live failures were intermittent and not reproduced during normal requests; injected
+      401s verified real session renewal to a fresh live result in an isolated cache. Concurrent failure checks made two
+      attempts for 25 callers, retained STALE cached data, and verified 403/429 handling and login-cookie preservation.
+      Live fundamentals/estimates/holdings/screening/names/profile checks returned HTTP 200. Actual CLI startup/confirmed
+      exit and all 27 headless smoke commands passed without Yahoo auth/rate errors. `FIELDS-CHEATSHEET.md` lists all 41
+      metrics plus estimates/analysts/holdings, units, periods and ten validated examples; README links it.
+- [x] TODO §2 security-type client pages (2026-10-24): canonical FUTURES/INDEX, legacy redirects and filtered ETF/equity
+      shortcuts; the universal query workflow and Coinbase live feed are retained. CLI startup/confirmed exit and four
+      live page/redirect smoke commands passed.
+- [x] TODO §3 financial data backbone (2026-10-24): added 41 financial fields, typed Yahoo/SEC metric, estimate and holdings
+      APIs, grouped provider operations, schema-v3 normalized persistence and per-security METRICS/EST/ANALYST/HOLD views.
+      Verified units/currencies, period separation, filing cutoffs/restatements, annual totals, no invented report/publication
+      dates, budgets/coverage, server ordering, restart/offline rebuilding, stale metadata, CLEAR context, ticker navigation
+      and 80×24 UI/help. Live checks loaded AAPL estimates/targets/ratings, SPY's 10 reported positions/allocations/fees,
+      2020 SEC metrics and market-wide financial filters. CLI startup/confirmed exit, the full 27-command live smoke and
+      six targeted financial-view smoke commands passed. Historical Yahoo estimate/holdings archives are not supplied.
+- [ ] Continue `docs/claude-prompts/features-TODO-pt2.md` §§4–6 (local ignored TODO): remaining data additions, then better
+      calendars and news. Add yfinance live price streaming before any future trading capabilities.
+- [x] Market-wide screener planning (2026-10-24): replaced every fixed-list screener with provider-wide query translation,
+      server filtering/sorting, shared cached pages, bounded residual scans and separate ranking/count coverage. Preserved
+      universal syntax, atomic validation and derived-field registration. Live checks covered all seven security types,
+      bond ETFs and movers; US price ranking included BRK-A across 19,808 candidates. Verified Boolean translation,
+      safe OR/NOT handling, nulls, residuals, quant dependencies, tie boundaries, duplicate/failed/short pages, offline and
+      projection reuse, cooldowns and 80×24 UI routing/help. Actual CLI startup/confirmed exit, the full 27-command live
+      smoke and four targeted live screener commands passed. Isolated Yahoo session caches resolved initial stale-cookie
+      401s. Yahoo's own coverage/quotes and capped local scans remain explicit; no market-wide completeness beyond the
+      provider's screenable universe is claimed.
+- [x] Shared tabular query engine and security screeners (2026-10-24): added typed predicates/boolean groups, search,
+      sorting, fields, limits, dataset registration and dependency-based derived fields. Connected WEI/CMDTY/CRYPTO/MOST
+      and added EQUITY/ETF/FUND/FX/BONDS (ETF proxies), layered dot commands, scoped popup/help/completion, active query
+      display and explicit symbol navigation. Verified null semantics, ordering before limits, literal preservation,
+      atomic errors, offline reuse, adapter coverage, quant extension, live freshness, 80×24 UI, panes/history and help
+      focus. Actual CLI startup/confirmed exit, final 27-command live smoke and seven targeted live screener commands
+      passed. Yahoo enrichment intermittently returned 401 (cached/missing fields labelled); one crypto quote was missing
+      and an options chain was temporarily empty. Universes remain curated; no market-wide completeness is implied.
+- [ ] **Alpaca IEX edge cases need live verification**. Simulated checks passed HTTP validation/rejection,
+      the 30-symbol cap, websocket authentication/subscription acknowledgments, nanosecond trade timestamps,
+      malformed records, REST overflow, overlay math and stream-auth refusal. Live smoke authenticated and subscribed 13 symbols. Verify the
       30-symbol cap, a meaningful-difference banner/dashed line, and REST polling for symbols beyond the cap.
 - [ ] Verify interactive behavior in a real terminal (macOS Terminal + iTerm): price flash, focus colors, Tab between panes,
       and that `Ctrl+1/2/4` arrive (Terminal.app usually doesn't send them; `/LAYOUT n` is the fallback).
 - [ ] Visually check Sixel in iTerm2 and image output in Kitty on physical terminals (font-size changes, modal clipping,
       resize and pane closure). Protocol widgets, generated frames and pane-specific cleanup passed automated checks.
-- [ ] FA uses calendar-aligned XBRL frames (CY2023 etc.), so fiscal years that end mid-year are labelled by the nearest
-      calendar year. Consider labelling by `fy` from 10-K rows instead.
+- [x] FA uses filing-derived fiscal year ends and fiscal quarters, latest reported values and standalone cash-flow
+      quarters derived from cumulative facts. Checked Apple September and Microsoft June year ends against SEC records.
 - [ ] Optional from brief: EX-27 financial data schedule parsing for late-1990s filings (not built).
-- [ ] MOST ranks a fixed 40-name large-cap universe (deterministic). `yf.screen("day_gainers")` could replace it with a fallback.
+- [x] MOST uses market-wide Yahoo US equity screening and shared query planning for gainers/losers/activity.
 - [ ] GC custom-date overlay uses FRED DGS* series (back to 1962 for most tenors). The treasury.gov par-curve CSV is not used.
 - [ ] Text fallback OHLC draws one plotext series per bar and can be slow on large windows; pixel rendering uses geometry directly.
-- [ ] Market holidays are hardcoded for 2025–2027 (`app.NYSE_HOLIDAYS`). Early closes are not modeled.
+- [x] Scheduled NYSE holidays are computed in `freeterm/market.py`, including Good Friday and observed holidays;
+      July 3, the Friday after Thanksgiving and Christmas Eve model applicable 13:00 ET closes. Checked early-close
+      boundaries, observed closures and dates beyond 2027. Exceptional future exchange closures still require updates.
 
 ## Smoke test (run after every change)
 ```

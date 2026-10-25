@@ -7,6 +7,40 @@ vibe coded open-source finance data terminal
 python3.11 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python -m freeterm      # or: .venv/bin/ft
 ```
+- Screen securities by type with `/EQUITY`, `/ETF`, `/FUND`, `/INDEX`, `/FUTURES`, `/CRYPTO` and `/FX`.
+  `/CMDTY` redirects to FUTURES, `/WEI` to INDEX, `/BONDS` to filtered ETFs and `/MOST` to equity movers.
+  Categories and themes use filters within these pages. All query Yahoo's screenable universe.
+  `/EQUITY .SORT price DESC` requests a market-wide ranking. Equities/ETFs default to US; explicit region/exchange
+  conditions override that scope. Crypto defaults to USD pairs. FUTURES covers commodity and financial futures and
+  uses Yahoo's reported volume. Prices retain their quoted currencies, displayed in the table.
+  Press `.` for commands; `?`, popup `HOME` or `.HELP` lists syntax and available fields.
+  Example: `/EQUITY .WHERE price > 10 AND volume >= 1000000 .SORT volume DESC .LIMIT 20`.
+  Repeated `.WHERE` and `.SEARCH "text"` clauses use AND. `.SORT`, `.FIELDS` and `.LIMIT` replace earlier settings;
+  `.CLEAR [WHERE|SEARCH|SORT|FIELDS|LIMIT|ALL]` resets them. Group OR conditions with parentheses.
+  Quote text/tickers (`.WHERE symbol = "BRK.B"`); `.FIELDS symbol,name,price` selects columns.
+  Missing values sort last and need `IS NULL` to match. Failed chains preserve all previous screening settings.
+  `/GP _symbol="identifier"` preserves an explicit security identifier independently of command names.
+  The backend translates supported conditions/sorts to Yahoo, reuses five-minute page caches and fetches additional
+  pages sequentially only when needed. Local conditions/quant fields use bounded scans; partial rankings are labelled.
+  `[screener].max_pages` controls the scan budget (default 8, maximum 40; pages hold at most 250 rows). Narrowing
+  `.WHERE` reduces requests. Ctrl+R forces refresh. Yahoo sessions use app-owned caches under `~/.freeterm/cache/yahoo`.
+- Equity fields include valuation, growth, profitability, leverage, liquidity, dividends, shares/float, short interest
+  and analyst targets (41 financial fields; `?` lists names, units and periods). For example:
+  `/EQUITY .WHERE market_cap > 1000000000000 AND roe > 15 .FIELDS symbol,roe,revenue_growth,debt_equity`.
+  Percentages use percentage points (`roe > 15` means 15%); `debt_equity` is a ratio (`< 1` means below 100%).
+  Quarterly growth and TTM growth are separate. Supported conditions/sorts run at Yahoo; additional financial lookups
+  reuse grouped six-hour snapshots and are capped by `[screener].max_enrich_symbols` (default 25, maximum 100).
+  Narrow server-supported filters first. Lookup limits/unavailable fields and partial rankings remain visible.
+  The printable [financial fields cheat sheet](FIELDS-CHEATSHEET.md) lists every field, units, periods and examples.
+- Query financial data for a security with `/METRICS AAPL`, `/EST AAPL`, `/ANALYST AAPL` and `/HOLD SPY`.
+  All use the same dot commands: `/EST AAPL .WHERE period = '+1y' .FIELDS eps_mean,eps_growth,revenue_mean`,
+  `/HOLD SPY .WHERE kind = 'holding' AND weight > 5 .SORT weight DESC`, or
+  `/ANALYST AAPL .WHERE kind = 'rating_change' .SORT date DESC`.
+  `/METRICS AAPL SEC 2020-12-31 .WHERE value IS NOT NULL` calculates SEC metrics using facts filed by that date.
+  SEC calculations retain fiscal dates and filing dates; annual reports take precedence at fiscal year ends.
+  Yahoo estimates/targets are current snapshots, not historical estimates. Holdings may cover only reported top positions;
+  HOLD also includes sector/asset allocations, bond metrics and fees. Unknown reporting dates remain N/A and ambiguous
+  provider statistics retain their provider units. CLEAR preserves the selected security/source/date.
 - An uppercase letter opens the command line for a ticker (`AAPL`); `/` opens it for a command
   (`/WEI`, `/GC`, `/FA AAPL`, `AAPL /FA`, `/COMP SPY QQQ`, `/? apple`). Commands require `/`;
   bare words always select symbols in the primary line. The graph popup uses bare commands instead. Press `?` or run `/HELP` for help.
@@ -132,6 +166,9 @@ Provider policies retain rate limiting/backoff. Analysis keys include parameters
 and calculation versions; chart windows, indicators, comparisons and DAT reuse these results.
 Ctrl+R refreshes stored inputs and bypasses older dependent results; OMON REFRESH targets its
 expiry/chain. Failed fetches expose STALE fallback metadata and status warnings.
+Yahoo resource requests coordinate one anonymous-session renewal after a final 401, then share a
+60-second authentication cooldown; 429s pause them for five minutes. Login cookies are preserved.
+Profiles/books use grouped quoteSummary data without the SDK's extra quote/timeseries lookups.
 
 Cleanup runs at startup and at most every ten minutes: 1,500 datasets / 256 MiB of compressed
 content, two million OHLCV rows total, 100,000 observations per series, two years without access,

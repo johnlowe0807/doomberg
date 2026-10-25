@@ -37,8 +37,10 @@ FUNCS = {
     "GC": 4, "BTMM": 4, "SPRD": 4, "AUCT": 4, "FRED": 4, "FA": 6, "ERN": 6, "FIL": 6,
     "EVTS": 6, "IEX": 7, "LAYOUT": 1, "?": 8, "DAT": 5, "BOOK": 5,
     "IND": 8, "CMP": 8, "MODE": 8, "TIME": 8, "SIZE": 8, "TF": 8, "GOTO": 8, "??": 8, "FRED?": 4, "FRED??": 4,
+    "EQUITY": 3, "ETF": 3, "INDEX": 3, "FX": 3, "FUND": 3, "BONDS": 4, "FUTURES": 3,
+    "METRICS": 6, "EST": 6, "ANALYST": 6, "HOLD": 6,
 }
-SEC_FUNCS = {"Q", "DES", "FREDDES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL", "DAT", "BOOK"}
+SEC_FUNCS = {"Q", "DES", "FREDDES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL", "DAT", "BOOK", "METRICS", "EST", "ANALYST", "HOLD"}
 SUFFIXES = {"US", "EQUITY", "INDEX", "CURNCY", "COMDTY", "GOVT"}
 
 
@@ -325,8 +327,11 @@ FUNC_HELP = [
     ("COMP A B [_fred=ID]", "mixed-source comparison; _mode=NORMALIZED|REAL|STACKED"),
     ("OMON", "option monitor; dot commands: EXP/SIDE/STRIKE/WIDTH/OPEN/HIST/BOOK"), ("FA", "financial statements (EDGAR XBRL)"), ("FIL", "SEC filings + reader"),
     ("ERN", "earnings history + 8-K releases"), ("MON", "watchlist"), ("EVTS", "watchlist earnings calendar"),
-    ("HOME", "home dashboard"), ("WEI", "world indices"), ("MOST", "movers"), ("CMDTY", "commodities"), ("FXC", "FX cross matrix"),
-    ("CRYPTO", "crypto (Coinbase live)"), ("TOP", "top news (RSS)"), ("GC", "Treasury curve"), ("BTMM", "rates / money markets"),
+    ("HOME", "home dashboard"), ("INDEX", "world indices; /WEI alias"), ("MOST", "filtered equity movers shortcut"), ("FUTURES", "all futures; commodities use filters; /CMDTY alias"), ("FXC", "FX cross matrix"),
+    ("EQUITY /ETF /FUND /FX", "security-type screeners; /BONDS opens filtered ETFs"),
+    ("METRICS /EST /ANALYST /HOLD", "per-security financial metrics, estimates, analysts and reported fund holdings; dot queries"),
+    (".WHERE/.SEARCH/.SORT/.FIELDS/.LIMIT", "shared board queries; '.' opens commands; ? lists fields"),
+    ("CRYPTO", "crypto screener; Coinbase live on charts"), ("TOP", "top news (RSS)"), ("GC", "Treasury curve"), ("BTMM", "rates / money markets"),
     ("SPRD", "IG/HY spreads + 2s10s"), ("AUCT", "Treasury auctions"), ("FRED <ID>", "chart a FRED series; /DES from its graph describes it"),
     ("FRED? <text> [filters]", "search FRED series; /FRED?? lists column filters and values"),
     ("IEX", "toggle Alpaca IEX overlay"), ("? <text> [filters]", "search securities; /?? lists column filters and values"), ("LAYOUT 1|2|4", "pane layout"), ("HELP", "this help"),
@@ -486,6 +491,10 @@ class FreeTerm(App):
     def action_help(self) -> None:
         if not isinstance(self.screen, ModalScreen):
             p = self.active_pane()
+            if getattr(p.view, 'table_commands_enabled', False):
+                from .graph_commands import GraphHelpScreen
+                self.push_screen(GraphHelpScreen(p.view))
+                return
             self.push_screen(HelpScreen(p.view.hints if p.view else ""))
 
     # -- layout
@@ -591,19 +600,19 @@ class FreeTerm(App):
         if re.match(r"/(?:\?|FRED\?)", line, re.I):
             await self._navigate(pane, line, push)
             return
-        match = re.search(r"(?<!\S)\.(?=[A-Za-z?])", line)
-        if match is None:
+        from data_layer.query_language import split_navigation
+        navigation, commands = split_navigation(line)
+        if not commands:
             await self._navigate(pane, line, push)
             return
-        navigation, commands = line[:match.start()].strip().lstrip(":"), line[match.start():]
         history_size = len(pane.history)
         if navigation and not await self._navigate(pane, navigation, push):
             return
         if navigation and push and len(pane.history) > history_size:
-            pane.history[-1] = line.strip().upper()
+            pane.history[-1] = line.strip()
         graph = self.active_command_target(pane)
         if graph is None:
-            self.hub.warn("This view has no .commands; open a graph or /OMON first")
+            self.hub.warn("This view has no .commands; open a security board, graph or /OMON first")
             return
         try:
             graph.execute_graph_command(commands)
@@ -611,12 +620,28 @@ class FreeTerm(App):
             self.hub.warn(str(error))
 
     async def _navigate(self, pane: Pane, line: str, push: bool = True) -> bool:
+        # Explicit identifiers bypass command/suffix interpretation, including future ticker spellings.
+        import shlex
         try:
-            func, sec, args = parse(line, self.aliases)
-        except ValueError as e:
-            if str(e):
-                self.hub.warn(str(e))
-            return False
+            words = shlex.split(line)
+        except ValueError as error:
+            self.hub.warn(str(error)); return False
+        explicit_symbols = [word.split('=', 1)[1] for word in words if word.lower().startswith('_symbol=')]
+        if explicit_symbols:
+            if len(explicit_symbols) != 1 or not explicit_symbols[0] or not words[0].startswith('/') or words[0][1:].upper() not in SEC_FUNCS:
+                self.hub.warn('Use /GP _symbol="identifier" (one nonempty symbol on a security view)'); return False
+            remaining = [word for word in words[1:] if not word.lower().startswith('_symbol=')]
+            # Avoid ambiguity between positional and explicit symbols.
+            if remaining:
+                self.hub.warn('Use _symbol= by itself; apply settings with dot commands'); return False
+            func, sec, args = words[0][1:].upper(), explicit_symbols[0], []
+        else:
+            try:
+                func, sec, args = parse(line, self.aliases)
+            except ValueError as e:
+                if str(e):
+                    self.hub.warn(str(e))
+                return False
         if func == "LAYOUT":
             await self.set_layout(int(args[0]) if args and args[0] in "124" else 1)
             return True
@@ -666,7 +691,12 @@ class FreeTerm(App):
             args, sec = refs + ['_mode=' + selected_mode] + [a for a in args if is_range(a)], None
         if cls is None:
             cls = type(f"Stub{func}", (StubView,), {"FUNC": func})
-        await pane.show(cls(self.hub, sec, args), line.strip().upper(), push)
+        try:
+            view = cls(self.hub, sec, args)
+        except ValueError as error:
+            self.hub.warn(str(error))
+            return False
+        await pane.show(view, line.strip(), push)
         self.update_hints()
         return True
 
@@ -722,11 +752,14 @@ class FreeTerm(App):
             i = (i + 1) % len(opts)
         else:
             from .graph_commands import VERBS, available_verbs
+            from data_layer.query_language import dot_offsets
             graph = self.active_command_target()
             verbs = available_verbs(graph) if graph is not None else VERBS
             pool = sorted({"." + verb for verb in (*verbs, "HELP")} if last.startswith(".") else
-                          {"/" + f for f in FUNCS} if last.startswith("/") else
-                          set(self.aliases) | set(load_watchlist()))
+                          {"/" + f for f in FUNCS if f not in ('CMDTY', 'WEI', 'BONDS')} if last.startswith("/") else
+                          ({name.upper() for name in graph.dataset.fields} | {'ASC', 'DESC', 'AND', 'OR', 'IS', 'NULL', 'NOT', 'IN', 'LIKE', 'CONTAINS'}
+                           if getattr(graph, 'table_commands_enabled', False) and dot_offsets(raw_stem) else
+                           set(self.aliases) | set(load_watchlist())))
             opts = [w for w in pool if w.startswith(last)] or [last]
             stem, i = raw_stem, 0
         self.tab_state = (stem, opts, i)

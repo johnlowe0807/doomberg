@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import time
 from .query_models import Quote, ResourceQuery
+from .yahoo_session import YahooSession
 
 class RateLimiter:
     """Min-interval limiter with exponential backoff on 429 / rate-limit errors."""
@@ -132,6 +133,13 @@ class Ingestion:
     def __init__(self, config, limiters, yf_provider):
         self.cfg, self.limiters, self.yf = config, limiters, yf_provider
         self._client = None
+        self.yahoo_session = YahooSession()
+
+    def initialize_yahoo(self, directory):
+        """Use app-owned public-session cookies, independently of other yfinance programs."""
+        import yfinance as yf
+        yf.set_tz_cache_location(str(directory))
+        self.yahoo_session.owns_cookie_cache = True
 
     @property
     def client(self):
@@ -165,12 +173,13 @@ class Ingestion:
             return await self.http(source, p['url'], as_json=p.get('as_json', True),
                                    per_sec=p.get('per_sec', 8 if source == 'sec' else 2), headers=headers,
                                    retries=p.get('retries', 2))
+        authenticated = op not in ('commodity',)
+        if authenticated:
+            self.yahoo_session.check()
         def fetch():
             import yfinance as yf
             symbol = p.get('symbol')
             ticker = yf.Ticker(symbol) if symbol else None
-            if op in ('profile', 'book'):
-                return ticker.info
             if op == 'expiries':
                 return ticker.options
             if op == 'chain':
@@ -185,6 +194,33 @@ class Ingestion:
                 return ticker.news
             if op == 'screen':
                 return yf.screen(p['screen'], count=50)
+            if op == 'market-screen':
+                from .yahoo_screening import fetch_page
+                return fetch_page(p)
+            if op in ('profile', 'book', 'fundamental-data', 'estimate-data', 'holdings-data'):
+                from yfinance.data import YfData
+                modules = {
+                    'fundamental-data': 'financialData,defaultKeyStatistics,summaryDetail,price,quoteType,assetProfile',
+                    'estimate-data': 'earningsTrend,financialData,price,recommendationTrend,upgradeDowngradeHistory,industryTrend,sectorTrend,indexTrend',
+                    'holdings-data': 'topHoldings,fundProfile,summaryProfile,quoteType,price',
+                }['fundamental-data' if op in ('profile', 'book') else op]
+                payload = YfData().get_raw_json('https://query2.finance.yahoo.com/v10/finance/quoteSummary/' + symbol,
+                    params={'modules': modules, 'formatted': 'false', 'corsDomain': 'finance.yahoo.com'})
+                result = (payload or {}).get('quoteSummary', {})
+                if result.get('error') or not result.get('result'):
+                    raise ValueError('Yahoo returned no financial dataset')
+                data = result['result'][0]
+                if op in ('profile', 'book'):
+                    from .financial_fields import raw
+                    # Match the public info shape without its extra quote and
+                    # timeseries requests (which can swallow/log HTTP failures).
+                    info = {key: raw(value) for module in data.values() if isinstance(module, dict)
+                            for key, value in module.items() if key != 'maxAge'}
+                    if isinstance(info.get('dividendYield'), (int, float)):
+                        info['dividendYield'] *= 100
+                    info.setdefault('fullExchangeName', info.get('exchangeName'))
+                    return info
+                return data
             if op == 'search':
                 return yf.Search(p['text'], max_results=p.get('limit', 100), news_count=0,
                                  lists_count=0, enable_fuzzy_query=True, timeout=12).quotes
@@ -200,6 +236,8 @@ class Ingestion:
                 return commodity_snapshot(frame, p['symbols'], p['date'])
             raise ValueError(f'Unknown Yahoo operation {op}')
         async with self.limiters['yf']:
+            if authenticated:
+                return await asyncio.to_thread(self.yahoo_session.run, fetch)
             return await asyncio.to_thread(fetch)
 
     async def close(self):

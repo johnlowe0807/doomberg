@@ -41,6 +41,7 @@ DEFAULT_CONFIG: dict = {
         "macd": "12,26,9",
     },
     "options": {"strikes_each_side": 12, "risk_free_fallback": 0.045},
+    "screener": {"max_pages": 8, "max_enrich_symbols": 25},  # bounded pages and per-security financial lookups
     "sec": {"user_agent": "freeterm/0.1 personal-research freeterm@example.com"},
     "news": {
         "feeds": [

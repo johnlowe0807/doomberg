@@ -16,7 +16,7 @@ import pandas as pd
 from .query_models import Metadata
 from .serialization import key, pack, unpack
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 class Repository:
@@ -36,7 +36,7 @@ class Repository:
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA foreign_keys=ON')
             version = self.db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, SCHEMA_VERSION):
+            if version not in (0, 1, 2, SCHEMA_VERSION):
                 raise RuntimeError(f'Unsupported data schema {version}')
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS datasets (
@@ -90,6 +90,23 @@ class Repository:
                 CREATE TABLE IF NOT EXISTS discovery_runs (
                     domain TEXT, query TEXT, fetched REAL, PRIMARY KEY(domain, query)) WITHOUT ROWID;
             ''')
+            self.db.executescript('''
+                CREATE TABLE IF NOT EXISTS fundamental_metrics (
+                    dataset TEXT REFERENCES datasets(id) ON DELETE CASCADE, ordinal INTEGER,
+                    symbol TEXT, metric TEXT, value REAL, unit TEXT, period TEXT, period_end TEXT,
+                    filed TEXT, record BLOB NOT NULL, PRIMARY KEY(dataset, ordinal)) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS metrics_lookup ON fundamental_metrics(symbol, metric, period_end);
+                CREATE TABLE IF NOT EXISTS analyst_estimates (
+                    dataset TEXT REFERENCES datasets(id) ON DELETE CASCADE, ordinal INTEGER,
+                    symbol TEXT, kind TEXT, period TEXT, period_end TEXT, record BLOB NOT NULL,
+                    PRIMARY KEY(dataset, ordinal)) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS estimates_lookup ON analyst_estimates(symbol, period);
+                CREATE TABLE IF NOT EXISTS fund_holdings (
+                    dataset TEXT REFERENCES datasets(id) ON DELETE CASCADE, ordinal INTEGER,
+                    fund TEXT, symbol TEXT, kind TEXT, weight REAL, report_date TEXT, record BLOB NOT NULL,
+                    PRIMARY KEY(dataset, ordinal)) WITHOUT ROWID;
+                CREATE INDEX IF NOT EXISTS holdings_lookup ON fund_holdings(fund, symbol, report_date);
+            ''')
             for table in ('bars', 'series'):
                 if 'fetched' not in {r[1] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                     self.db.execute(f'ALTER TABLE {table} ADD COLUMN fetched REAL')
@@ -104,7 +121,9 @@ class Repository:
                 return None
             self.db.execute('UPDATE datasets SET accessed=? WHERE id=?', (time.time(), identity))
             kind, header = row['kind'], unpack(row['header']) if row['header'] else None
-            if kind in ('bars', 'series'):
+            if kind in ('fundamental_metrics', 'analyst_estimates', 'fund_holdings'):
+                data = [unpack(r[0]) for r in self.db.execute(f'SELECT record FROM {kind} WHERE dataset=? ORDER BY ordinal', (identity,))]
+            elif kind in ('bars', 'series'):
                 values = self.db.execute(f'SELECT * FROM {kind} WHERE dataset=? ORDER BY stamp', (identity,)).fetchall()
                 index = pd.to_datetime([v['stamp'] for v in values], utc=bool(header['tz']))
                 if header['tz']:
@@ -236,6 +255,16 @@ class Repository:
                     self.db.execute('INSERT OR IGNORE INTO news_topics VALUES(?,?)', (identity, article))
             elif kind == 'document':
                 self.db.execute('INSERT INTO documents VALUES(?,?)', (identity, pack(data)))
+            elif kind == 'fundamental_metrics':
+                self.db.executemany('INSERT INTO fundamental_metrics VALUES(?,?,?,?,?,?,?,?,?,?)',
+                    ((identity, i, r['symbol'], r['metric'], r.get('value'), r.get('unit'), r.get('period'),
+                      r.get('period_end'), r.get('filing_date'), pack(r)) for i, r in enumerate(data)))
+            elif kind == 'analyst_estimates':
+                self.db.executemany('INSERT INTO analyst_estimates VALUES(?,?,?,?,?,?,?)',
+                    ((identity, i, r['symbol'], r['kind'], r.get('period'), r.get('period_end'), pack(r)) for i, r in enumerate(data)))
+            elif kind == 'fund_holdings':
+                self.db.executemany('INSERT INTO fund_holdings VALUES(?,?,?,?,?,?,?,?)',
+                    ((identity, i, r['fund'], r['symbol'], r['kind'], r.get('weight'), r.get('report_date'), pack(r)) for i, r in enumerate(data)))
         return data, Metadata(source, observed, fetched, version, 'fresh', 'provider')
 
     def register_series(self, identity, symbol, interval):
