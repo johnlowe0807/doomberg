@@ -10,15 +10,15 @@ from textual.containers import VerticalScroll
 from textual.widgets import DataTable, Static
 
 from .app import VIEWS, View
-from .symbols import parse_filters, matches_filters, rank
+from data_layer.symbols import parse_filters, matches_filters, rank
 
-from .fred_discovery import COLUMNS, FREQUENCIES, ADJUSTMENTS, HELP, catalog, parse_query, matches
+from data_layer.fred_discovery import COLUMNS, FREQUENCIES, ADJUSTMENTS, HELP, catalog, parse_query, matches
 
-from .normalization import parse_page
+from data_layer.normalization import parse_page
 
 
 async def search(hub, query, publish=None):
-    from .query_models import SearchQuery
+    from data_layer.query_models import SearchQuery
     text, filters = parse_query(query)
     request = SearchQuery('fred', text, filters)
     if publish:

@@ -21,7 +21,9 @@ from textual.screen import ModalScreen
 from textual.widgets import DataTable, Input, Static
 
 from .config import Config, load_aliases, load_watchlist, save_watchlist
-from .data import DataHub, Quote, RANGES, IVS, is_range, is_interval
+from .data import DataHub
+from data_layer.query_models import Quote
+from data_layer.windows import RANGES, IVS, is_range, is_interval
 from .dialogs import QuitConfirm
 from .market import market_status
 
@@ -656,7 +658,7 @@ class FreeTerm(App):
                 args.append(pane.view.iv)
         cls = VIEWS.get(func)
         if func == 'COMP':
-            from .comparison import parse as parse_comparison
+            from data_layer.comparison import parse as parse_comparison
             try:
                 refs, selected_mode = parse_comparison(([sec] if sec else []) + args, self.aliases)
             except ValueError as error:

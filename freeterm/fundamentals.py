@@ -43,16 +43,16 @@ async def cik_for(hub, sym: str) -> int | None:
 
 
 async def companyfacts(hub, cik: int):
-    from .query_models import FactsQuery
+    from data_layer.query_models import FactsQuery
     return hub.value(await hub.query(FactsQuery(cik)))
 
 
 async def filings(hub, cik: int) -> list[dict]:
-    from .query_models import FilingsQuery
+    from data_layer.query_models import FilingsQuery
     return hub.value(await hub.query(FilingsQuery(cik))) or []
 
 
-from .normalization import html_to_text
+from data_layer.normalization import html_to_text
 
 
 async def filing_text(hub, cik: int, f: dict, exhibit_991: bool = False) -> str:
@@ -65,7 +65,7 @@ async def filing_text(hub, cik: int, f: dict, exhibit_991: bool = False) -> str:
         pick = pick or [n for n in names if "99" in n and re.search(r"\.(htm|html|txt)$", n, re.I)]
         doc = pick[0] if pick else doc
     url = f"{base}/{doc}" if doc else f"https://www.sec.gov/Archives/edgar/data/{cik}/{f['acc']}.txt"
-    from .query_models import TextQuery
+    from data_layer.query_models import TextQuery
     result = await hub.query(TextQuery('sec', url))
     if not result.data:
         return f"Could not fetch {url}"

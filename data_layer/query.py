@@ -220,7 +220,7 @@ class QueryService:
             return await self.analysis(AnalysisQuery('readable-document', asdict(query), (result.meta.version,), 'extraction-v1'),
                                        lambda: normalize(result.data), inputs=(result.meta,), force=force)
         if isinstance(query, BarsQuery):
-            from .data import base_for, slice_range, resample_ohlcv, candle_interval
+            from .windows import base_for, slice_range, resample_ohlcv, candle_interval
             base = base_for(query.range, query.interval)
             if base is None:
                 return Result(None, Metadata('yf', reason='Interval unavailable for selected window'))
@@ -244,7 +244,7 @@ class QueryService:
                         raise ValueError(f'No history for {query.symbol}')
                     return frame
                 raw, fetched = await self._response(identity, fetch, min(60, self.history_ttl(query)), refresh)
-                from .data import flag_bad_volume
+                from .windows import flag_bad_volume
                 def normalize():
                     data = raw[['Open', 'High', 'Low', 'Close', 'Volume']].dropna(subset=['Close']).copy()
                     data = data[~data.index.duplicated(keep='last')].sort_index()
@@ -256,7 +256,7 @@ class QueryService:
                 if result.meta.cache != 'session-only':
                     await asyncio.to_thread(self.repository.register_series, identity, query.symbol, query.interval)
                 if query.period.lower() != 'max':
-                    from .data import slice_range
+                    from .windows import slice_range
                     data = await asyncio.to_thread(slice_range, result.data, query.period.upper().replace('MO', 'M'))
                     result = Result(data, result.meta, result.inputs)
             return result

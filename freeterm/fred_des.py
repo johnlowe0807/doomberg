@@ -12,7 +12,7 @@ from textual.binding import Binding
 from .app import VIEWS, View
 
 
-from .normalization import parse_description
+from data_layer.normalization import parse_description
 
 
 async def description(hub, sid):

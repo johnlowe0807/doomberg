@@ -24,7 +24,7 @@ def web_url(url: str) -> bool:
         return False
 
 
-from .normalization import readable_text, extract_article
+from data_layer.normalization import readable_text, extract_article
 
 
 class BrowserConfirm(ConfirmScreen):
@@ -76,7 +76,7 @@ class ArticleReader(Pager):
         body = ""
         try:
             if web_url(url):
-                from .query_models import TextQuery
+                from data_layer.query_models import TextQuery
                 result = await self.hub.query(TextQuery('articles', url))
                 body = result.data or ''
             if not body:

@@ -14,7 +14,7 @@ from textual.widgets import DataTable, Static
 
 from .app import DIM, ET, WARN, VIEWS, View, colored, fbig, fnum
 from .charts import DEF_IV, PERIOD, RANGES
-from .options import remember_quote, name as option_name, contract, number
+from data_layer.options import remember_quote, name as option_name, contract, number
 
 
 # ---------------------------------------------------------------- DES
@@ -122,11 +122,11 @@ class HpView(View):
 
 
 # ---------------------------------------------------------------- news
-from .normalization import norm_yf_news
+from data_layer.normalization import norm_yf_news
 
 
 async def rss(hub, url: str) -> list[dict]:
-    from .query_models import NewsQuery
+    from data_layer.query_models import NewsQuery
     return hub.value(await hub.query(NewsQuery(feeds=(url,)))) or []
 
 
@@ -139,7 +139,7 @@ class NewsView(View):
         yield DataTable(cursor_type="row")
 
     async def fetch(self) -> list[dict]:
-        from .query_models import NewsQuery
+        from data_layer.query_models import NewsQuery
         result = await self.hub.query(NewsQuery(feeds=tuple(self.app.cfg.get("news", "feeds", []))))
         return result.data or []
 
@@ -173,7 +173,7 @@ class CnView(NewsView):
     refresh_secs = 300
 
     async def fetch(self) -> list[dict]:
-        from .query_models import NewsQuery
+        from data_layer.query_models import NewsQuery
         feed = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={self.sec}&region=US&lang=en-US"
         result = await self.hub.query(NewsQuery(symbol=self.sec, feeds=(feed,)))
         return result.data or []
@@ -395,7 +395,7 @@ class SearchView(View):
         yield DataTable(cursor_type="row")
 
     async def load(self) -> None:
-        from .symbols import search_symbols
+        from data_layer.symbols import search_symbols
         q = " ".join(self.args).strip()
         if not q:
             self.render_matches([])
@@ -430,7 +430,7 @@ class SearchHelpView(View):
     hints = "Up/Down scroll  Esc back  /? text search"
 
     def compose(self):
-        from .symbols import SEARCH_HELP
+        from data_layer.symbols import SEARCH_HELP
         with VerticalScroll():
             yield Static(SEARCH_HELP, markup=False)
 

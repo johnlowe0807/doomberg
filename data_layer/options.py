@@ -37,7 +37,7 @@ def number(value):
 
 
 def remember_quote(hub, row, metadata=None):
-    from .data import Quote
+    from .query_models import Quote
     symbol, last = row.get("contractSymbol"), number(row.get("lastPrice"))
     if not symbol or last is None or last < 0:
         return

@@ -8,8 +8,8 @@ from textual.widgets import DataTable, Static
 
 from .app import VIEWS, View, fbig, fnum
 from .charts import DEF_IV, default_interval
-from .data import IVS, RANGES, is_range, is_interval, candle_interval, step_interval
-from .options import contract, number, snapshot
+from data_layer.windows import IVS, RANGES, is_range, is_interval, candle_interval, step_interval
+from data_layer.options import contract, number, snapshot
 
 
 def statistics(frame, interval):

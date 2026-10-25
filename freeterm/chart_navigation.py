@@ -7,7 +7,7 @@ from datetime import datetime
 
 import pandas as pd
 
-from .data import candle_interval
+from data_layer.windows import candle_interval
 
 
 @dataclass

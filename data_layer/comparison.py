@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import numpy as np
 import pandas as pd
-from .data import is_range, candle_interval, slice_range
+from .windows import is_range, candle_interval, slice_range
 
 MODES = ('NORMALIZED', 'REAL', 'STACKED')
 
@@ -78,8 +78,8 @@ def securities(refs):
 
 async def fetch(hub, ref, rng, interval):
     if ref.startswith('FRED:'):
-        from .charts import fred
-        return await fred(hub, ref[5:])
+        from .query_models import SeriesQuery
+        return (await hub.query(SeriesQuery(ref[5:]))).data
     if ref.startswith('ERN:'):
         symbol = ref[4:]
         frame = await hub.resource('yf', 'earnings', symbol=symbol)

@@ -14,11 +14,11 @@ from textual_plotext import PlotextPlot
 
 from .app import DIM, UP, DOWN, WARN, VIEWS, View, fbig, fnum, colored, tag_text
 from .app import regular_hours
-from .data import IVS, RANGES, is_range, range_days, range_span_days, slice_range, candle_interval, step_interval
+from data_layer.windows import IVS, RANGES, is_range, range_days, range_span_days, slice_range, candle_interval, step_interval
 from .live import age, iex_eval
 from .pixelcharts import ChartSurface, GraphicsFailed, PixelSizeChanged, Panel, Scene, Trace, color_dual_axes, render_stacked_text
-from .options import contract, name as option_name
-from . import comparison
+from data_layer.options import contract, name as option_name
+import data_layer.comparison as comparison
 
 PERIOD = {"1D": "1d", "5D": "5d", "1M": "1mo", "3M": "3mo", "6M": "6mo", "YTD": "ytd", "1Y": "1y", "5Y": "5y", "MAX": "max"}
 DEF_IV = {"1D": "5m", "5D": "15m", "1M": "1h", "3M": "1d", "6M": "1d", "YTD": "1d", "1Y": "1d", "5Y": "1wk", "MAX": "1wk"}
@@ -36,12 +36,12 @@ def default_interval(rng):
 
 
 # ---------------------------------------------------------------- indicators
-from .analytics import ints, sma, ema, rsi, macd, vwap
+from data_layer.analytics import ints, sma, ema, rsi, macd, vwap
 
 
 # ---------------------------------------------------------------- FRED
 async def fred(hub, sid: str) -> pd.Series | None:
-    from .query_models import SeriesQuery
+    from data_layer.query_models import SeriesQuery
     return hub.value(await hub.query(SeriesQuery(sid)))
 
 
@@ -169,7 +169,7 @@ class ChartView(View):
             df = pd.concat(ss, axis=1).ffill()
             self.df = slice_range(df, self.rng)
         elif self.mode == "comp":
-            from .query_models import ComparisonQuery
+            from data_layer.query_models import ComparisonQuery
             try:
                 result = await self.hub.query(ComparisonQuery(tuple(self.compare_refs), self.rng, self.iv, self.compare_mode))
                 data = result.data
@@ -350,7 +350,7 @@ class ChartView(View):
             self.hub.warn(f'{self.title}: chart error {type(error).__name__}: {error}'[:120])
 
     async def _prepare_indicators(self, signature):
-        from .analytics import indicators
+        from data_layer.analytics import indicators
         frame, active, parameters = self.df.copy(), set(self.ind), dict(self.parameters)
         try:
             result = await self.hub.derive('indicators', {'active': sorted(active), 'parameters': parameters}, [frame],

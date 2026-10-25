@@ -48,7 +48,7 @@ def available_verbs(chart):
     if chart.mode == "comp":
         return ("CMP", "MODE", "TIME", "TF", "GOTO") + (("SIZE",) if chart.uses_price_intervals else ())
     from .live import is_us_equity
-    from .options import contract
+    from data_layer.options import contract
     return tuple(verb for verb in VERBS if verb != 'MODE' and (verb != 'CHAIN' or contract(chart.sec)) and (verb != "IEX" or is_us_equity(chart.sec)))
 
 
@@ -181,7 +181,7 @@ def execute(chart, line):
 
 def execute_one(chart, line):
     from .charts import default_interval
-    from .data import candle_interval, range_days, slice_range, parse_timeframe
+    from data_layer.windows import candle_interval, range_days, slice_range, parse_timeframe
     from .live import set_iex
     verb, args, options = parse_command(line)
     if verb == "HELP":
@@ -258,7 +258,7 @@ def execute_one(chart, line):
         chart.draw()
         chart.app.tick()
     elif verb == "CMP":
-        from .comparison import parse, securities
+        from data_layer.comparison import parse, securities
         if args == ["OFF"]:
             if options:
                 raise ValueError('CMP OFF takes no arguments')
@@ -290,7 +290,7 @@ def execute_one(chart, line):
         chart.retitle()
         chart.reload()
     elif verb == 'MODE':
-        from .comparison import mode, validate_mode, normalized
+        from data_layer.comparison import mode, validate_mode, normalized
         if len(args) != 1:
             raise ValueError('Use MODE NORMALIZED, MODE REAL or MODE STACKED')
         selected_mode = mode(args[0]); validate_mode(selected_mode, chart.compare_refs)
@@ -332,7 +332,7 @@ def execute_one(chart, line):
         slice_range(pd.DataFrame(index=pd.DatetimeIndex([pd.Timestamp.now()])), rng)
         interval = candle_interval(args[1] if len(args) == 2 else default_interval(rng)).value
         if verb == "TF" and chart.uses_price_intervals and chart.hub.base_for(rng, interval) is None:
-            from .data import IVS
+            from data_layer.windows import IVS
             interval = next((iv for iv in IVS if chart.hub.base_for(rng, iv) is not None), interval)
         if chart.uses_price_intervals and chart.hub.base_for(rng, interval) is None:
             raise ValueError(f"{interval} history is unavailable for {rng}; use a coarser interval")
@@ -447,7 +447,7 @@ class GraphCommandScreen(ModalScreen):
         choices = [stem_prefix + prefix + verb for verb in (*available_verbs(self.chart), "HELP", "?")]
         current = head.split()[-1].lstrip('./') if head.split() else ''
         if getattr(self.chart, 'view_commands_enabled', False):
-            from .data import RANGES
+            from data_layer.windows import RANGES
             values = {'EXP': ['NEXT', 'PREV', 'FIRST', 'LAST', 'LIST', *self.chart.expiries],
                       'EXPIRY': ['NEXT', 'PREV', 'FIRST', 'LAST', 'LIST', *self.chart.expiries],
                       'SIDE': ['CALL', 'PUT'], 'STRIKE': ['ATM', 'NEXT', 'PREV'], 'HIST': RANGES, 'GRAPH': RANGES}
@@ -455,7 +455,7 @@ class GraphCommandScreen(ModalScreen):
         elif current == 'GOTO':
             choices = [stem_prefix + word for word in ('LEFT', 'RIGHT', '+10', '-10')] + choices
         elif current == 'MODE':
-            from .comparison import MODES
+            from data_layer.comparison import MODES
             choices = [stem_prefix + word for word in MODES] + choices
         tokens = head.split()
         boundaries = command_starts(tokens)

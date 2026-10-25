@@ -12,7 +12,7 @@ import re
 import time
 from datetime import datetime
 
-from .data import Quote
+from data_layer.query_models import Quote
 
 CB_WS = "wss://ws-feed.exchange.coinbase.com"
 CB_PRODUCTS = "https://api.exchange.coinbase.com/products"

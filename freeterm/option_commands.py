@@ -4,7 +4,7 @@ from __future__ import annotations
 import re
 import shlex
 from datetime import date
-from .options import number
+from data_layer.options import number
 
 VERBS = ('EXP', 'SIDE', 'STRIKE', 'WIDTH', 'UNDERLYING', 'OPEN', 'GRAPH', 'HIST', 'BOOK', 'REFRESH')
 ALIASES = {'EXPIRY': 'EXP', 'SYM': 'UNDERLYING', 'HISTORY': 'HIST'}
@@ -72,7 +72,7 @@ def side(value):
 
 def execute_one(view, verb, args):
     from .graph_commands import GraphHelpScreen
-    from .data import is_range, candle_interval
+    from data_layer.windows import is_range, candle_interval
     if verb in ('HELP', '?'):
         if args:
             raise ValueError('HELP takes no arguments')

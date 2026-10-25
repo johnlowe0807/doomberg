@@ -14,10 +14,10 @@ from textual.widgets import DataTable, Static
 
 from .app import DIM, WARN, VIEWS, View, MonView, PromptScreen, fbig, fnum, colored, tag_text
 from .charts import QuoteChartView, HomePreview, fred, PALETTE
-from .data import Quote
+from data_layer.query_models import Quote
 from .pixelcharts import ChartSurface, Panel, Scene, Trace
 
-from .catalog import BOARDS, TAPE
+from data_layer.catalog import BOARDS, TAPE
 
 
 class QuoteBoard(View):
@@ -258,7 +258,7 @@ class HomeView(View):
 
 
 # ---------------------------------------------------------------- bonds
-from .catalog import TENORS
+from data_layer.catalog import TENORS
 
 
 def asof(s: pd.Series | None, when: pd.Timestamp):
