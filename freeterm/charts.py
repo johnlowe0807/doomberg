@@ -16,7 +16,7 @@ from .app import DIM, UP, DOWN, WARN, VIEWS, View, fbig, fnum, colored, tag_text
 from .app import regular_hours
 from data_layer.windows import IVS, RANGES, is_range, range_days, range_span_days, slice_range, candle_interval, step_interval
 from .live import age, iex_eval
-from .pixelcharts import ChartSurface, GraphicsFailed, PixelSizeChanged, Panel, Scene, Trace, color_dual_axes, render_stacked_text
+from .pixelcharts import ChartSurface, GraphicsFailed, PixelSizeChanged, Panel, Scene, Trace
 from data_layer.options import contract, name as option_name
 import data_layer.comparison as comparison
 
@@ -551,28 +551,6 @@ class ChartView(View):
         e.stop()
 
 RGB_HEX_M = "#FF5FD2"
-
-# plotext builds the figure lazily inside PlotextPlot.render(), outside our try/except in draw().
-# Wrap it so a plotext error renders as a message + status warning instead of crashing the app.
-_plot_render = PlotextPlot.render
-
-
-def _safe_render(self):
-    try:
-        scene = getattr(self.parent, 'scene', None)
-        if scene is not None and scene.panels and scene.panels[0].independent:
-            return render_stacked_text(self, scene)
-        return color_dual_axes(_plot_render(self), getattr(self.parent, 'scene', None))
-    except Exception as e:
-        try:
-            self.app.hub.warn(f"chart render {type(e).__name__}: {e}"[:120])
-        except Exception:
-            pass
-        return Text(f"chart unavailable ({type(e).__name__})", style=WARN)
-
-
-PlotextPlot.render = _safe_render
-
 
 class GIPView(ChartView):
     FUNC = "GIP"
