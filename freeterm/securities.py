@@ -13,33 +13,18 @@ from data_layer.options import contract, number, snapshot
 
 
 def statistics(frame, interval):
-    data = frame.replace([np.inf, -np.inf], np.nan).dropna(subset=["Close"])
-    if data.empty:
-        return []
-    first, last = data.iloc[0], data.iloc[-1]
-    change = float(last.Close - first.Close)
-    percent = 100 * change / float(first.Close) if first.Close else None
-    volume = data.get("Volume", pd.Series(np.nan, index=data.index))
-    fmt = lambda value: fnum(number(value))
-    rows = [("Bars", str(len(data))), ("First close", fmt(first.Close)), ("Last close", fmt(last.Close)),
-            ("Change over range", fnum(change)), ("Return over range", fnum(percent) + "%"),
-            ("Opening price", fmt(first.Open)), ("High over range", fmt(data.High.max())),
-            ("Low over range", fmt(data.Low.min())), ("Average close", fmt(data.Close.mean())),
-            ("Median close", fmt(data.Close.median())), ("Total volume", fbig(number(volume.sum(min_count=1)))),
-            (f"Average volume / {interval} bar", fbig(number(volume.mean()))),
-            (f"Median volume / {interval} bar", fbig(number(volume.median()))),
-            (f"Maximum volume / {interval} bar", fbig(number(volume.max()))),
-            ("Average bar range", fmt((data.High - data.Low).mean())),
-            ("Return volatility / bar", fmt(data.Close.pct_change(fill_method=None).std() * 100) + "%"),
-            ("Up bars (close > open)", str(int((data.Close > data.Open).sum()))),
-            ("Down bars (close < open)", str(int((data.Close < data.Open).sum())))]
-    if interval != "1wk":
-        sessions = volume.groupby(volume.index.date).sum(min_count=1)
-        rows.append(("Average volume / observed day", fbig(number(sessions.mean()))))
-    bad = int(data.BadVol.fillna(False).sum()) if "BadVol" in data else 0
-    if bad:
-        rows.append(("Bad Yahoo volume prints excluded", str(bad)))
-    return rows
+    from data_layer.analytics import statistics_records
+    labels=('Bars','First close','Last close','Change over range','Return over range','Opening price','High over range',
+        'Low over range','Average close','Median close','Total volume',f'Average volume / {interval} bar',
+        f'Median volume / {interval} bar',f'Maximum volume / {interval} bar','Average bar range','Return volatility / bar',
+        'Up bars (close > open)','Down bars (close < open)')
+    result=[]
+    for i,row in enumerate(statistics_records(frame,interval)):
+        label=labels[i] if i<len(labels) else 'Bad Yahoo volume prints excluded' if row['metric']=='bad_volume' else 'Average volume / observed day'
+        unit,value=row['unit'],row['value']
+        text=str(int(value)) if unit=='count' and value is not None else fbig(value) if unit=='provider_volume' else fnum(value)
+        result.append((label,text+('%' if unit=='percent' else '')))
+    return result
 
 
 class DatView(View):

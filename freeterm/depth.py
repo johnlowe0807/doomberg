@@ -180,26 +180,7 @@ class CnView(NewsView):
 
 
 # ---------------------------------------------------------------- OMON
-def _ncdf(x): return 0.5 * (1 + math.erf(x / math.sqrt(2)))
-def _npdf(x): return math.exp(-x * x / 2) / math.sqrt(2 * math.pi)
-
-
-def bs_greeks(S, K, T, r, sigma, call: bool):
-    """Black-Scholes greeks. theta per calendar day, vega per 1 vol point."""
-    if not (S and K and T > 0 and sigma and sigma > 0):
-        return None
-    st = sigma * math.sqrt(T)
-    d1 = (math.log(S / K) + (r + sigma * sigma / 2) * T) / st
-    d2 = d1 - st
-    gamma = _npdf(d1) / (S * st)
-    vega = S * _npdf(d1) * math.sqrt(T) / 100
-    if call:
-        delta = _ncdf(d1)
-        theta = (-S * _npdf(d1) * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * _ncdf(d2)) / 365
-    else:
-        delta = _ncdf(d1) - 1
-        theta = (-S * _npdf(d1) * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * _ncdf(-d2)) / 365
-    return delta, gamma, theta, vega
+from data_layer.analytics import bs_greeks
 
 
 class OmonView(View):

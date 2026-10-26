@@ -1,5 +1,6 @@
 """Canonical financial fields. Percent values use percentage points (15 means 15%)."""
 from dataclasses import dataclass
+from .field_values import raw, number
 
 
 @dataclass(frozen=True)
@@ -58,15 +59,10 @@ METRICS = {
 }
 
 
-def raw(value):
-    return value.get('raw') if isinstance(value, dict) else value
-
-
 def values(data, *, quote=False):
-    from .tabular import clean
     result = {}
     for name, spec in METRICS.items():
-        value = clean(raw(data.get(spec.key)) if spec.key else None, 'number')
+        value = raw(data.get(spec.key)) if spec.key else None
         scale = spec.quote_scale if quote and spec.quote_scale is not None else spec.scale
-        result[name] = value * scale if value is not None else None
+        result[name] = number(value, scale)
     return result

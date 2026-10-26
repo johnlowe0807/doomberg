@@ -38,6 +38,9 @@ HELP = (
 
 
 def available_verbs(chart):
+    if getattr(chart, 'extraction_commands_enabled', False):
+        from data_layer.extraction import VERBS as DATA_VERBS
+        return DATA_VERBS
     if getattr(chart, 'table_commands_enabled', False):
         from .screen_commands import VERBS as TABLE_VERBS
         return TABLE_VERBS
@@ -65,6 +68,8 @@ def available_indicators(chart):
 
 
 def graph_help(chart):
+    if getattr(chart, 'extraction_commands_enabled', False):
+        return chart.help_text()
     if getattr(chart, 'table_commands_enabled', False):
         from .screen_commands import help_text
         return help_text(chart)
@@ -164,6 +169,8 @@ def command_starts(words):
 
 def execute(chart, line):
     """Run graph commands in input order; stop at the first failure, retaining earlier changes."""
+    if getattr(chart, 'extraction_commands_enabled', False):
+        return chart.execute_graph_command(line)
     if getattr(chart, 'table_commands_enabled', False):
         from .screen_commands import execute as execute_table
         return execute_table(chart, line)

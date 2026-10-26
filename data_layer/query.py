@@ -17,7 +17,9 @@ from .ingestion import Ingestion
 from .normalization import fred_series, norm_yf_news, rss_items
 from .query_models import (ComparisonQuery, BarsQuery, StoredBarsQuery, TextQuery, AnalysisQuery, FactsQuery, FilingsQuery, HistoryQuery, Metadata,
                            NewsQuery, Query, QuotesQuery, ResourceQuery, Result, SearchQuery, SeriesQuery, TableQuery, TableData,
-                           FundamentalsQuery, EstimatesQuery, HoldingsQuery)
+                           FundamentalsQuery, EstimatesQuery, HoldingsQuery, OwnershipQuery, CorporateActionsQuery,
+                           SharesQuery, ResearchQuery, StatementsQuery, EventsQuery, NewsRecordsQuery, NewsArticleQuery,
+                           CompanyQuery, FinancialArchiveQuery, YahooPricesQuery, ExtractQuery, ExtractedData)
 from .serialization import key
 from .storage import Repository, ResultCache
 
@@ -32,6 +34,9 @@ POLICIES = {
     'news': (300, 30), 'screen': (300, 30), 'search': (600, 60), 'names': (86400, 60),
     'market-screen': (300, 300),
     'fundamental-data': (21600, 21600), 'estimate-data': (3600, 3600), 'holdings-data': (86400, 86400),
+    'plug-ownership': (21600, 3600), 'plug-actions': (21600, 3600), 'plug-shares': (21600, 3600),
+    'plug-research': (21600, 3600), 'plug-statement': (21600, 3600), 'plug-company': (21600, 3600),
+    'plug-calendar': (3600, 300), 'plug-news': (300, 60), 'plug-search-news': (300, 60),
     'commodity': (300, 60), 'secfacts': (86400, 60), 'secsub': (86400, 60),
     'secdocs': (365 * 86400, 60), 'secidx': (365 * 86400, 60), 'sec': (7 * 86400, 60),
     'rss': (300, 30), 'fred-search': (86400, 60), 'fred-meta': (86400, 60),
@@ -58,6 +63,11 @@ class QueryService:
         register(self)
         from .financial_data import register as register_financial
         register_financial(self)
+        from .yahoo_datasets import register as register_yahoo
+        register_yahoo(self)
+        from .access import register as register_access
+        register_access(self)
+        self.yahoo_streams = []
 
     def register_table(self, name, dataset):
         """Register a dataset adapter once; all clients share the same query semantics."""
@@ -179,7 +189,8 @@ class QueryService:
                     return await self._dataset(identity, kind, source, ttl, loader, filters=filters)
                 try:
                     stored = await asyncio.to_thread(self.repository.put, identity, kind, source, result.data,
-                                                     result.meta.fetched_at, result.meta.observed_at)
+                                                     result.meta.fetched_at, result.meta.observed_at,
+                                                     complete=result.meta.complete,coverage=result.meta.coverage,reason=result.meta.reason)
                 except Exception as error:
                     self.warn(f'Data store write failed: {type(error).__name__}; result is session-only')
                     version = await asyncio.to_thread(key, result.data)
@@ -200,6 +211,10 @@ class QueryService:
         self.inflight[flight_key] = task
         task.add_done_callback(lambda _: self.inflight.pop(flight_key, None))
         return await asyncio.shield(task)
+
+    @overload
+    async def query(self, query: ExtractQuery, *, force: bool = False,
+                    stored_only: bool = False) -> Result[ExtractedData | None]: ...
 
     @overload
     async def query(self, query: HistoryQuery | BarsQuery | StoredBarsQuery, *, force: bool = False,
@@ -230,10 +245,25 @@ class QueryService:
                     stored_only: bool = False) -> Result[TableData | None]: ...
 
     @overload
+    async def query(self, query: OwnershipQuery | CorporateActionsQuery | SharesQuery | ResearchQuery | StatementsQuery |
+                    EventsQuery | NewsRecordsQuery | CompanyQuery | FinancialArchiveQuery | YahooPricesQuery,
+                    *, force: bool = False, stored_only: bool = False) -> Result[list[dict] | None]: ...
+
+    @overload
+    async def query(self, query: NewsArticleQuery, *, force: bool = False,
+                    stored_only: bool = False) -> Result[dict | None]: ...
+
+    @overload
     async def query(self, query: ResourceQuery, *, force: bool = False,
                     stored_only: bool = False) -> Result[Any]: ...
 
     async def query(self, query: Query, *, force: bool = False, stored_only: bool = False) -> Result[Any]:
+        if isinstance(query, ExtractQuery):
+            from .extraction import execute
+            return await execute(self, query, force=force, stored_only=stored_only)
+        from .yahoo_datasets import REQUESTS, snapshot as yahoo_snapshot
+        if isinstance(query,REQUESTS):
+            return await yahoo_snapshot(self,query,force=force,stored_only=stored_only)
         if isinstance(query, (FundamentalsQuery, EstimatesQuery, HoldingsQuery)):
             from .financial_data import snapshot
             return await snapshot(self, query, force=force, stored_only=stored_only)
@@ -531,6 +561,8 @@ class QueryService:
 
     async def close(self):
         self.closing = True
+        for stream in self.yahoo_streams:
+            await stream.stop()
         tasks = list(self.inflight.values())
         for task in tasks:
             task.cancel()
@@ -540,3 +572,12 @@ class QueryService:
             await asyncio.to_thread(self.repository.close)
             await asyncio.to_thread(self.cache.repo.close)
         self.ready = False
+
+    async def start_yahoo_stream(self, symbols, on_record=None):
+        """Opt-in data-layer stream; existing terminal feeds are unaffected."""
+        from .yahoo_stream import YahooPriceStream
+        await self.initialize()
+        stream=YahooPriceStream(self,symbols,on_record=on_record)
+        self.yahoo_streams.append(stream)
+        await stream.start()
+        return stream

@@ -15,8 +15,9 @@ import pandas as pd
 
 from .query_models import Metadata
 from .serialization import key, pack, unpack
+from . import record_store
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 
 class Repository:
@@ -36,7 +37,7 @@ class Repository:
             self.db.execute('PRAGMA journal_mode=WAL')
             self.db.execute('PRAGMA foreign_keys=ON')
             version = self.db.execute('PRAGMA user_version').fetchone()[0]
-            if version not in (0, 1, 2, SCHEMA_VERSION):
+            if version not in (0, 1, 2, 3, SCHEMA_VERSION):
                 raise RuntimeError(f'Unsupported data schema {version}')
             self.db.executescript('''
                 CREATE TABLE IF NOT EXISTS datasets (
@@ -111,6 +112,7 @@ class Repository:
                 if 'fetched' not in {r[1] for r in self.db.execute(f'PRAGMA table_info({table})')}:
                     self.db.execute(f'ALTER TABLE {table} ADD COLUMN fetched REAL')
                     self.db.execute(f'UPDATE {table} SET fetched=(SELECT fetched FROM datasets WHERE id=dataset)')
+            record_store.initialize(self.db)
             self.db.execute(f'PRAGMA user_version={SCHEMA_VERSION}')
             self.db.commit()
 
@@ -121,7 +123,9 @@ class Repository:
                 return None
             self.db.execute('UPDATE datasets SET accessed=? WHERE id=?', (time.time(), identity))
             kind, header = row['kind'], unpack(row['header']) if row['header'] else None
-            if kind in ('fundamental_metrics', 'analyst_estimates', 'fund_holdings'):
+            if kind in record_store.TABLES:
+                data = record_store.get(self.db, kind, identity)
+            elif kind in ('fundamental_metrics', 'analyst_estimates', 'fund_holdings'):
                 data = [unpack(r[0]) for r in self.db.execute(f'SELECT record FROM {kind} WHERE dataset=? ORDER BY ordinal', (identity,))]
             elif kind in ('bars', 'series'):
                 values = self.db.execute(f'SELECT * FROM {kind} WHERE dataset=? ORDER BY stamp', (identity,)).fetchall()
@@ -174,9 +178,10 @@ class Repository:
             else:
                 content = self.db.execute('SELECT content FROM documents WHERE dataset=?', (identity,)).fetchone()
                 data = unpack(content[0])
-            return data, Metadata(row['source'], row['observed'], row['fetched'], row['version'], 'fresh', 'store')
+            coverage = {k: header[k] for k in ('complete', 'coverage', 'reason') if isinstance(header, dict) and k in header}
+            return data, Metadata(row['source'], row['observed'], row['fetched'], row['version'], 'fresh', 'store', **coverage)
 
-    def put(self, identity, kind, source, data, fetched, observed=None):
+    def put(self, identity, kind, source, data, fetched, observed=None, *, complete=None, coverage='', reason=''):
         """Atomically publish a complete normalized dataset and its content version."""
         incoming = None
         previous_fetches = {}
@@ -194,8 +199,12 @@ class Repository:
                     if combined.index.equals(data.index):
                         combined.index = data.index
                     data = combined.iloc[-100000:]
+        if kind in record_store.TABLES:
+            with self.lock:
+                data = record_store.prepare(self.db,kind,identity,data)
+                data = record_store.merge(self.db, kind, identity, data)
         version = key(data)
-        header = None
+        header = {'complete': complete, 'coverage': coverage, 'reason':reason} if kind in record_store.TABLES else None
         if kind in ('bars', 'series'):
             header = dict(tz=str(data.index.tz) if data.index.tz else None, index_name=data.index.name,
                           name=data.name if kind == 'series' else None, unit=data.index.unit, freq=data.index.freqstr,
@@ -212,6 +221,8 @@ class Repository:
             self.db.execute('DELETE FROM datasets WHERE id=?', (identity,))
             self.db.execute('INSERT INTO datasets VALUES(?,?,?,?,?,?,?,?,?)',
                             (identity, kind, source, observed, fetched, version, pack(header), time.time(), size))
+            if kind in record_store.TABLES:
+                record_store.put(self.db, kind, identity, data)
             if kind == 'bars':
                 records = []
                 for stamp, values in zip(data.index.as_unit('ns').asi8, data.itertuples(index=False, name=None)):
@@ -265,7 +276,50 @@ class Repository:
             elif kind == 'fund_holdings':
                 self.db.executemany('INSERT INTO fund_holdings VALUES(?,?,?,?,?,?,?,?)',
                     ((identity, i, r['fund'], r['symbol'], r['kind'], r.get('weight'), r.get('report_date'), pack(r)) for i, r in enumerate(data)))
-        return data, Metadata(source, observed, fetched, version, 'fresh', 'provider')
+            if kind in record_store.FINANCIAL:
+                record_store.capture(self.db, kind, data, fetched, source)
+        return data, Metadata(source, observed, fetched, version, 'fresh', 'provider', complete=complete, coverage=coverage)
+
+    def financial_captures(self, *args, **kwargs):
+        with self.lock:
+            return record_store.captures(self.db, *args, **kwargs)
+
+    def capture_financial(self, kind, rows, fetched, source):
+        with self.lock, self.db:
+            record_store.capture(self.db, kind, rows, fetched, source)
+
+    def put_yahoo_prices(self, rows):
+        with self.lock, self.db:
+            record_store.put_prices(self.db, rows)
+
+    def yahoo_prices(self, *args, **kwargs):
+        with self.lock:
+            return record_store.prices(self.db, *args, **kwargs)
+
+    def article(self, article_id):
+        with self.lock:
+            row = self.db.execute('SELECT a.record FROM article_records a JOIN datasets d ON d.id=a.dataset '
+                                  'WHERE a.article_id=? ORDER BY d.fetched DESC LIMIT 1', (article_id,)).fetchone()
+            return unpack(row[0]) if row else None
+
+    def articles(self, symbols=(), limit=10000, prefix=None):
+        with self.lock:
+            sql='SELECT a.*,d.fetched,ROW_NUMBER() OVER (PARTITION BY a.article_id,a.symbol ORDER BY d.fetched DESC) AS priority FROM article_records a JOIN datasets d ON d.id=a.dataset'
+            args=[]
+            conditions=[]
+            if symbols:
+                conditions.append('a.symbol IN ('+','.join('?' for _ in symbols)+')')
+                args.extend(symbols)
+            if prefix:
+                conditions.append('a.dataset LIKE ?');args.append(prefix+'%')
+            if conditions:sql+=' WHERE '+' AND '.join(conditions)
+            rows=self.db.execute('SELECT record FROM ('+sql+') WHERE priority=1 '
+                'ORDER BY COALESCE(published_at,published_date) DESC LIMIT ?',(*args,limit)).fetchall()
+            return [unpack(r[0]) for r in rows]
+
+    def record_observations(self, table, **filters):
+        with self.lock:
+            return record_store.observations(self.db,table,**filters)
 
     def register_series(self, identity, symbol, interval):
         with self.lock, self.db:
@@ -351,6 +405,7 @@ class Repository:
 
     def cleanup(self):
         with self.lock, self.db:
+            record_store.cleanup(self.db)
             now = time.time()
             self.db.execute('DELETE FROM datasets WHERE accessed<?', (now - 730 * 86400,))
             rows = self.db.execute('SELECT id,size FROM datasets ORDER BY accessed DESC').fetchall()

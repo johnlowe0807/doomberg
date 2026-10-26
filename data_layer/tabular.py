@@ -5,20 +5,24 @@ import asyncio
 import math
 import re
 from dataclasses import dataclass, replace
+from datetime import date
 from typing import Callable
 
 from .query_models import (BooleanExpression, Condition, Result, SortOrder, TableData)
 from .serialization import key
+from . import field_values as scalar
 
 
 @dataclass(frozen=True)
 class Field:
-    kind: str  # text, number, boolean
+    kind: str  # text, number, boolean, date, timestamp
     title: str = ''
     dependencies: tuple[str, ...] = ()
     compute: Callable | None = None  # pure row calculation, run in a worker
     unit: str = ''
     period: str = ''
+    normalizer: Callable | None = None
+    case_sensitive: bool = False
 
 
 @dataclass(frozen=True)
@@ -32,7 +36,7 @@ class Dataset:
 
 
 def normalize(query, dataset):
-    """Validate before loading anything. Identifiers normalize; literal values do not."""
+    """Validate before I/O. Canonicalize typed values; ordinary text/tickers stay literal."""
     if type(query.limit) is not int or not 1 <= query.limit <= 10000:
         raise ValueError('LIMIT must be an integer from 1 to 10000')
     used = set()
@@ -69,12 +73,24 @@ def normalize(query, dataset):
         values = value if op == 'IN' else (value,)
         if not isinstance(values, (tuple, list)) or not values or len(values) > 1000:
             raise ValueError('IN needs 1–1000 values')
+        converted = []
         for v in values:
-            valid = (isinstance(v, str) if kind == 'text' else type(v) is bool if kind == 'boolean' else
-                     type(v) in (int, float) and math.isfinite(v))
+            if kind in ('date', 'timestamp'):
+                valid = isinstance(v, (str, date)) or (kind == 'timestamp' and type(v) in (int, float))
+            else:
+                valid = (isinstance(v, str) if kind == 'text' else type(v) is bool if kind == 'boolean' else
+                         type(v) in (int, float) and math.isfinite(v))
             if not valid:
                 raise ValueError(f'{name} expects {kind} values; use IS NULL for missing data')
-        return Condition(name, op, tuple(values) if op == 'IN' else value)
+            if kind == 'date' and isinstance(v, str) and not re.fullmatch(r'\d{4}-\d{2}-\d{2}', v):
+                raise ValueError(f'{name} expects a calendar date YYYY-MM-DD')
+            spec = dataset.fields[name]
+            canonical = (v if op in ('LIKE', 'CONTAINS') or (kind == 'text' and not spec.normalizer)
+                         else clean(v, spec))
+            if canonical is None:
+                raise ValueError(f'{name} expects a valid {kind}' + (' with UTC Z or an explicit offset' if kind == 'timestamp' else ''))
+            converted.append(canonical)
+        return Condition(name, op, tuple(converted) if op == 'IN' else converted[0])
 
     where = expression(query.where) if query.where is not None else None
     fields = tuple(field(f) for f in (query.fields or dataset.defaults))
@@ -110,20 +126,28 @@ def normalize(query, dataset):
 
 
 def clean(value, kind):
-    if value is None:
-        return None
-    if kind == 'number':
-        try:
-            return float(value) if not isinstance(value, bool) and math.isfinite(float(value)) else None
-        except (ValueError, TypeError, OverflowError):
-            return None
-    return value if ((isinstance(value, str) and kind == 'text') or (type(value) is bool and kind == 'boolean')) else None
+    spec = kind if isinstance(kind, Field) else Field(kind)
+    value = spec.normalizer(value) if spec.normalizer else scalar.raw(value)
+    if spec.kind == 'number':
+        return scalar.number(value)
+    if spec.kind == 'date':
+        return scalar.calendar_date(value)
+    if spec.kind == 'timestamp':
+        return scalar.timestamp(value)
+    if spec.kind == 'text':
+        return scalar.text(value)
+    return scalar.boolean(value) if spec.kind == 'boolean' else None
 
 
-def matches(node, row):
+def normalize_record(record, fields):
+    """Adapters normalize all known fields before publishing or persisting records."""
+    return {name: clean(value, fields[name]) if name in fields else value for name, value in record.items()}
+
+
+def matches(node, row, fields=None):
     """SQL three-valued logic: missing operands are unknown, including under NOT."""
     if isinstance(node, BooleanExpression):
-        values = [matches(c, row) for c in node.children]
+        values = [matches(c, row, fields) for c in node.children]
         if node.operator == 'NOT':
             return None if values[0] is None else not values[0]
         if node.operator == 'AND':
@@ -136,7 +160,7 @@ def matches(node, row):
         return value is not None
     if value is None:
         return None
-    if isinstance(value, str):
+    if isinstance(value, str) and not (fields and fields[node.field].case_sensitive):
         value = value.casefold()
         wanted = tuple(v.casefold() for v in wanted) if op == 'IN' else wanted.casefold()
     if op == 'IN':
@@ -168,18 +192,18 @@ def select(query, dataset, required, batch):
             spec = dataset.fields[name]
             if spec.compute:
                 row[name] = spec.compute(row)
-            row[name] = clean(row.get(name), spec.kind)
+            row[name] = clean(row.get(name), spec)
             if row[name] is None:
                 missing[name] += 1
         rows.append(row)
-    selected = [r for r in rows if (query.where is None or matches(query.where, r) is True) and
+    selected = [r for r in rows if (query.where is None or matches(query.where, r, dataset.fields) is True) and
                 all(term.casefold() in ' '.join(str(r.get(f) or '') for f in dataset.search_fields).casefold()
                     for term in query.search)]
     # Stable sorting; missing data is last in either direction. Never limit before selection.
     for order in reversed(query.sort):
         known = [r for r in selected if r[order.field] is not None]
         absent = [r for r in selected if r[order.field] is None]
-        known.sort(key=lambda r: r[order.field].casefold() if isinstance(r[order.field], str) else r[order.field],
+        known.sort(key=lambda r: r[order.field].casefold() if isinstance(r[order.field], str) and not dataset.fields[order.field].case_sensitive else r[order.field],
                    reverse=order.descending)
         selected = known + absent
     return TableData(tuple({f: r.get(f) for f in query.fields} for r in selected[:query.limit]), query.fields,
@@ -194,11 +218,11 @@ async def execute(service, query, *, force=False, stored_only=False):
         result = await dataset.executor(service, query, dataset, required, force, stored_only)
         if result.data is None:
             return result
-        version = await asyncio.to_thread(key, (query, result.data, result.meta.version))
+        version = await asyncio.to_thread(key, (scalar.VERSION, query, result.data, result.meta.version))
         return Result(result.data, replace(result.meta, version=version), result.inputs)
     result = await dataset.loader(service, required, force, stored_only)
     if result.data is None:
         return Result(None, result.meta, result.inputs)
     data = await asyncio.to_thread(select, query, dataset, required, result.data)
-    version = await asyncio.to_thread(key, (query, data, result.meta.version))
+    version = await asyncio.to_thread(key, (scalar.VERSION, query, data, result.meta.version))
     return Result(data, replace(result.meta, version=version), result.inputs)

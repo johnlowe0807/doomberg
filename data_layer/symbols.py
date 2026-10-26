@@ -11,20 +11,11 @@ def normalized(text):
 
 
 
-TYPE_ALIASES = {
-    "STOCK": "EQUITY", "STOCKS": "EQUITY", "EQUITIES": "EQUITY",
-    "FUTURES": "FUTURE", "COMMODITY": "FUTURE", "COMMODITIES": "FUTURE",
-    "CRYPTO": "CRYPTOCURRENCY", "CRYPTOCURRENCIES": "CRYPTOCURRENCY",
-    "FX": "CURRENCY", "FOREX": "CURRENCY", "CURRENCIES": "CURRENCY",
-    "INDICES": "INDEX", "INDEXES": "INDEX", "ETFS": "ETF",
-    "MUTUALFUNDS": "MUTUALFUND", "MUTUAL FUND": "MUTUALFUND",
-    "OPTIONS": "OPTION",
-}
+from .field_values import TYPE_ALIASES, security_type
 
 
 def canonical_type(value):
-    value = value.strip().upper()
-    return TYPE_ALIASES.get(value, value)
+    return security_type(value) or 'SECURITY'
 
 
 SEARCH_HELP = """Security search · /? text [filters]

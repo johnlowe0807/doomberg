@@ -103,14 +103,19 @@ class QuoteBoard(View):
         from dataclasses import replace
         request = self.table_query
         fields = request.fields or self.dataset.defaults
-        result = await self.hub.query(replace(request, fields=tuple(dict.fromkeys((*fields, 'symbol')))))
+        retained = tuple(self.dataset.fields) if isinstance(self, FinancialTableView) else ('symbol',)
+        result = await self.hub.query(replace(request, fields=tuple(dict.fromkeys((*fields, *retained)))))
         if request != self.table_query:
             return
+        self._detail_query = request
         if result.data is not None:
+            self._detail_rows = result.data.rows
             self._navigation = [row['symbol'] for row in result.data.rows]
             projected = tuple({field: row.get(field) for field in fields} for row in result.data.rows)
-            result = replace(result, data=replace(result.data, rows=projected, fields=fields))
+            result = replace(result, data=replace(result.data, rows=projected, fields=fields,
+                             missing={name: count for name, count in result.data.missing.items() if name in fields}))
         else:
+            self._detail_rows = ()
             self._navigation = []
         self.render_result(result)
 
@@ -166,6 +171,28 @@ class BondBoard(QuoteBoard):
 
 class FinancialTableView(QuoteBoard):
     refresh_secs = None
+    hints = '. commands  ? fields/help  Enter details  Shift+Enter price graph  Ctrl+R refresh'
+    BINDINGS = [Binding('shift+enter', 'price_graph', 'Price graph', show=False, priority=True)]
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected):
+        event.stop()
+        event.prevent_default()
+        if self.table_query != getattr(self, '_detail_query', None):
+            self.hub.warn('Table is updating; open details after the query completes')
+            return
+        index = int(event.row_key.value)
+        records = getattr(self, '_detail_rows', ())
+        if index >= len(records):
+            return
+        from .financial_details import FinancialDetail
+        table = self.query_one(DataTable)
+        self.app.push_screen(FinancialDetail(self, records[index]), lambda _: table.focus() if table.is_mounted else None)
+
+    def action_price_graph(self):
+        from shlex import quote
+        table = self.query_one(DataTable)
+        if table.row_count and table.cursor_row < len(self.navigation):
+            self.app.run_command('/GP _symbol=' + quote(self.navigation[table.cursor_row]))
 
     @property
     def title(self):

@@ -30,6 +30,10 @@ Quote text/tickers: symbol = "BRK.B" · name CONTAINS "oil" · symbol IN ('AAPL'
 LIKE uses % for any text and _ for one character. Text comparisons ignore case.
 Missing values never match comparisons, including NOT; use IS NULL explicitly.
 Missing sort values appear last with ASC or DESC. %Chg is in percentage points.
+Dates use YYYY-MM-DD; timestamps use ISO UTC Z or an explicit offset and compare as UTC instants.
+Date-only reporting/filing periods stay distinct from observation and fetch timestamps.
+Numeric epoch seconds remain accepted for timestamp comparisons. Invalid dates fail before querying.
+Currency codes normalize consistently; GBp (pence) remains distinct from GBP (pounds).
 Dot chains validate together: an error leaves all screening settings unchanged.
 Examples:
   /EQUITY .WHERE price > 10 AND volume >= 1000000 .SORT volume DESC .LIMIT 20
@@ -47,6 +51,9 @@ Pages: /EQUITY /ETF /FUND /INDEX /FUTURES /CRYPTO /FX
 /CMDTY redirects to FUTURES; /WEI to INDEX; /BONDS to filtered ETFs; /MOST to equity movers.
 /FXC retains its matrix; /OMON retains option navigation.
 /METRICS, /EST, /ANALYST and /HOLD query data for a selected security.
+Enter opens the full selected financial record; q/Esc returns with query/selection intact.
+Shift+Enter on a financial table explicitly opens its security price graph.
+ANALYST event_at is the UTC rating-change timestamp; date remains a compatibility alias.
 METRICS defaults to Yahoo; SEC [YYYY-MM-DD] selects SEC facts filed by that date.
 Yahoo estimates/targets are current snapshots, not historical point-in-time estimates.
 HOLD includes reported positions, sectors, asset classes, bond statistics and fees.

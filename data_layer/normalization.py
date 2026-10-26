@@ -7,6 +7,7 @@ import json
 from datetime import datetime, timezone
 import pandas as pd
 from bs4 import BeautifulSoup
+from .field_values import timestamp
 
 def norm_yf_news(items) -> list[dict]:
     """yfinance has shipped two news shapes: flat dicts and {'content': {...}}. Handle both."""
@@ -16,14 +17,8 @@ def norm_yf_news(items) -> list[dict]:
         url = ((c.get("canonicalUrl") or {}).get("url") or (c.get("clickThroughUrl") or {}).get("url")
                or c.get("link") or "")
         t = c.get("pubDate") or c.get("displayTime") or c.get("providerPublishTime")
-        try:
-            ts = datetime.fromtimestamp(t, timezone.utc) if isinstance(t, (int, float)) else pd.Timestamp(t).to_pydatetime()
-            if pd.isna(ts):
-                ts = None
-            elif ts.tzinfo is None:
-                ts = ts.replace(tzinfo=timezone.utc)
-        except Exception:
-            ts = None
+        normalized = timestamp(t, assume_timezone='UTC')
+        ts = datetime.fromisoformat(normalized) if normalized else None
         src = (c.get("provider") or {}).get("displayName") or c.get("publisher") or "Yahoo"
         if c.get("title"):
             out.append({"title": c["title"], "src": src, "ts": ts, "url": url,

@@ -39,6 +39,7 @@ FUNCS = {
     "IND": 8, "CMP": 8, "MODE": 8, "TIME": 8, "SIZE": 8, "TF": 8, "GOTO": 8, "??": 8, "FRED?": 4, "FRED??": 4,
     "EQUITY": 3, "ETF": 3, "INDEX": 3, "FX": 3, "FUND": 3, "BONDS": 4, "FUTURES": 3,
     "METRICS": 6, "EST": 6, "ANALYST": 6, "HOLD": 6,
+    "DATA": 8, "EXTRACT": 8,
 }
 SEC_FUNCS = {"Q", "DES", "FREDDES", "GP", "GIP", "HP", "CN", "OMON", "FA", "ERN", "FIL", "DAT", "BOOK", "METRICS", "EST", "ANALYST", "HOLD"}
 SUFFIXES = {"US", "EQUITY", "INDEX", "CURNCY", "COMDTY", "GOVT"}
@@ -330,6 +331,9 @@ FUNC_HELP = [
     ("HOME", "home dashboard"), ("INDEX", "world indices; /WEI alias"), ("MOST", "filtered equity movers shortcut"), ("FUTURES", "all futures; commodities use filters; /CMDTY alias"), ("FXC", "FX cross matrix"),
     ("EQUITY /ETF /FUND /FX", "security-type screeners; /BONDS opens filtered ETFs"),
     ("METRICS /EST /ANALYST /HOLD", "per-security financial metrics, estimates, analysts and reported fund holdings; dot queries"),
+    ("DATA [dataset] [symbol]", "all normalized datasets/fields; filters, pivots, calculations, summaries and exports"),
+    ("EXTRACT", "query the active screen's underlying records; retains context and selection limit"),
+    (".CALC/.PIVOT/.STATS/.EXPORT", "shared extraction operations; /DATA then ? lists syntax and every field"),
     (".WHERE/.SEARCH/.SORT/.FIELDS/.LIMIT", "shared board queries; '.' opens commands; ? lists fields"),
     ("CRYPTO", "crypto screener; Coinbase live on charts"), ("TOP", "top news (RSS)"), ("GC", "Treasury curve"), ("BTMM", "rates / money markets"),
     ("SPRD", "IG/HY spreads + 2s10s"), ("AUCT", "Treasury auctions"), ("FRED <ID>", "chart a FRED series; /DES from its graph describes it"),
@@ -610,6 +614,20 @@ class FreeTerm(App):
             return
         if navigation and push and len(pane.history) > history_size:
             pane.history[-1] = line.strip()
+        # The same extraction verbs work from specialized screens without changing their layout.
+        first = re.match(r'\.([A-Za-z]+)', commands)
+        extraction_verb = first and (first[1].upper() in ('EXTRACT','CALC','PIVOT','STATS','EXPORT') or
+            first[1].upper() in ('WHERE','SEARCH','SORT','FIELDS','LIMIT') and not getattr(pane.view,'table_commands_enabled',False))
+        if extraction_verb and not getattr(pane.view,'extraction_commands_enabled',False):
+            from .datasets import DataView, context_request
+            try:
+                source = context_request(pane.view)
+                view = DataView(self.hub,None,[]);view.request=source
+                await pane.show(view,line.strip(),push)
+                if first[1].upper() == 'EXTRACT':commands=commands[first.end():].strip()
+                if not commands:return
+            except ValueError as error:
+                self.hub.warn(str(error));return
         graph = self.active_command_target(pane)
         if graph is None:
             self.hub.warn("This view has no .commands; open a security board, graph or /OMON first")
@@ -626,6 +644,18 @@ class FreeTerm(App):
             words = shlex.split(line)
         except ValueError as error:
             self.hub.warn(str(error)); return False
+        if words and words[0].upper() in ('/DATA','/EXTRACT'):
+            from .datasets import DataView, context_request
+            try:
+                view = DataView(self.hub, None, words[1:] if words[0].upper() == '/DATA' else [])
+                if words[0].upper() == '/EXTRACT':
+                    if len(words) != 1 or pane.view is None:raise ValueError('Use /EXTRACT on an active data screen')
+                    view.request = context_request(pane.view)
+                await pane.show(view, line.strip(), push)
+                self.update_hints()
+                return True
+            except ValueError as error:
+                self.hub.warn(str(error)); return False
         explicit_symbols = [word.split('=', 1)[1] for word in words if word.lower().startswith('_symbol=')]
         if explicit_symbols:
             if len(explicit_symbols) != 1 or not explicit_symbols[0] or not words[0].startswith('/') or words[0][1:].upper() not in SEC_FUNCS:
@@ -802,4 +832,4 @@ def main() -> None:
 
 def register() -> None:
     """Import feature modules; each adds its views to VIEWS."""
-    from . import boards, charts, depth, fundamentals, securities, fred_search, fred_des  # noqa: F401
+    from . import boards, charts, depth, fundamentals, securities, fred_search, fred_des, datasets  # noqa: F401

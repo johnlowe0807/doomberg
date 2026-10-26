@@ -11,8 +11,9 @@ from dataclasses import dataclass, replace
 from functools import lru_cache
 
 from .query_models import BooleanExpression, Condition, Metadata, ResourceQuery, Result, TableBatch
-from .tabular import clean, select
+from .tabular import clean, select, normalize_record
 from .financial_fields import METRICS, values as metric_values
+from .field_values import currency
 
 NUMERIC = {'price': 'intradayprice', 'change': 'intradaypricechange', 'pct_change': 'percentchange',
            'volume': 'dayvolume', 'market_cap': 'intradaymarketcap', 'pe': 'peratio.lasttwelvemonths'}
@@ -61,8 +62,10 @@ def canonical_value(field, value, allowed):
         return value
     if isinstance(values, dict):
         values = set().union(*values.values())
+    if value in values:
+        return value
     for candidate in values:
-        if str(candidate).casefold() == str(value).casefold():
+        if (currency(candidate) == currency(value) if field == 'currency' else str(candidate).casefold() == str(value).casefold()):
             return candidate
     raise ValueError(f'Unknown {field} value {value!r}; use a provider-supported value')
 
@@ -231,6 +234,7 @@ def rows_from_page(data, kind, meta):
 
 
 async def execute(service, query, dataset, required, force, stored_only):
+    from .financial_data import enrich
     await service.initialize()
     query_plan = await asyncio.to_thread(plan, query, dataset)
     max_pages = max(1, min(40, int(service.ingestion.cfg.get('screener', 'max_pages', 8))))
@@ -280,7 +284,8 @@ async def execute(service, query, dataset, required, force, stored_only):
             break
         total = data['total']
         offset += len(data['quotes'])
-        new_rows = await asyncio.to_thread(rows_from_page, data, query_plan.kind, result.meta)
+        new_rows = await asyncio.to_thread(lambda: [normalize_record(row, dataset.fields)
+            for row in rows_from_page(data, query_plan.kind, result.meta)])
         page_symbols = set(seen)
         added = []
         for row in new_rows:
@@ -297,7 +302,6 @@ async def execute(service, query, dataset, required, force, stored_only):
         if not added and len(rows) < total:
             failed = 'Yahoo stopped pagination before the reported total'
             break
-        from .financial_data import enrich
         extra_inputs, covered = await enrich(service,rows,local_fields,budget,attempted,force=force,stored_only=stored_only)
         inputs.extend(extra_inputs)
         evaluable = rows[:covered]

@@ -3,7 +3,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any, Generic, Literal, TypeVar
+from typing import Any, Generic, Literal, TypeVar, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .tabular import Field
 
 T = TypeVar('T')
 Freshness = Literal['fresh', 'stale', 'unavailable']
@@ -18,6 +21,8 @@ class Metadata:
     freshness: Freshness = 'unavailable'
     cache: str = 'none'
     reason: str = ''
+    complete: bool | None = None  # coverage of the requested dataset, not the whole market
+    coverage: str = ''
 
 
 @dataclass(frozen=True)
@@ -185,6 +190,30 @@ class TableQuery:
 
 
 @dataclass(frozen=True)
+class DataStep:
+    operation: str
+    argument: str = ''
+
+
+@dataclass(frozen=True)
+class ExtractQuery:
+    """Bounded, ordered transformations over normalized records; never terminal-formatted values."""
+    source: TableQuery
+    steps: tuple[DataStep, ...] = ()
+    max_rows: int = 10000
+    stored_only: bool = False
+
+
+@dataclass(frozen=True)
+class ExtractedData:
+    table: TableData
+    schema: dict[str, Field]
+    scope: str
+    request: ExtractQuery | None = None
+    coverage: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class FundamentalsQuery:
     symbol: str
     source: Literal['yahoo', 'sec'] = 'yahoo'
@@ -199,6 +228,86 @@ class EstimatesQuery:
 @dataclass(frozen=True)
 class HoldingsQuery:
     symbol: str
+
+
+@dataclass(frozen=True)
+class OwnershipQuery:
+    symbol: str
+
+
+@dataclass(frozen=True)
+class CorporateActionsQuery:
+    symbol: str
+    start: str | None = None  # inclusive calendar date; end is exclusive
+    end: str | None = None
+
+
+@dataclass(frozen=True)
+class SharesQuery:
+    symbol: str
+    start: str = '2000-01-01'
+    end: str | None = None
+
+
+@dataclass(frozen=True)
+class ResearchQuery:
+    scope: Literal['sector', 'industry']
+    key: str
+    region: str = 'US'
+
+
+@dataclass(frozen=True)
+class StatementsQuery:
+    symbol: str
+    statement: Literal['income', 'balance', 'cashflow'] = 'income'
+    period: Literal['annual', 'quarterly', 'ttm'] = 'annual'
+
+
+@dataclass(frozen=True)
+class EventsQuery:
+    kind: Literal['earnings', 'ipo', 'economic', 'splits', 'dividends'] = 'earnings'
+    start: str | None = None  # inclusive date, default today; end exclusive, default +7 days
+    end: str | None = None
+    symbol: str | None = None
+    region: str | None = None  # earnings default US; other calendars default provider-wide
+    max_pages: int = 4  # at most 100 rows per page; coverage is explicit
+
+
+@dataclass(frozen=True)
+class NewsRecordsQuery:
+    symbols: tuple[str, ...] = ()
+    text: str = ''
+    start: str | None = None  # inclusive ISO date/instant; end exclusive
+    end: str | None = None
+    limit: int = 100
+
+
+@dataclass(frozen=True)
+class NewsArticleQuery:
+    article_id: str  # retained Yahoo body or summary; never fetches a publisher
+
+
+@dataclass(frozen=True)
+class CompanyQuery:
+    symbol: str
+    dataset: Literal['profile', 'sustainability', 'filings', 'earnings_history'] = 'profile'
+
+
+@dataclass(frozen=True)
+class FinancialArchiveQuery:
+    symbol: str
+    dataset: Literal['fundamentals', 'estimates', 'holdings'] = 'estimates'
+    as_of: str | None = None  # latest capture at/before this UTC instant, otherwise retained captures
+    source: str = 'yf'
+    limit: int = 10000
+
+
+@dataclass(frozen=True)
+class YahooPricesQuery:
+    symbols: tuple[str, ...]
+    start: str | None = None  # UTC instant bounds; no bounds selects latest per symbol
+    end: str | None = None
+    limit: int = 10000
 
 
 @dataclass(frozen=True)
@@ -224,6 +333,8 @@ class TableData:
     matched_exact: bool = True
 
 
-Query = (HistoryQuery | SeriesQuery | QuotesQuery | ResourceQuery | FactsQuery | FilingsQuery | NewsQuery |
+Query = (ExtractQuery | HistoryQuery | SeriesQuery | QuotesQuery | ResourceQuery | FactsQuery | FilingsQuery | NewsQuery |
          SearchQuery | BarsQuery | StoredBarsQuery | TextQuery | ComparisonQuery | TableQuery |
-         FundamentalsQuery | EstimatesQuery | HoldingsQuery)
+         FundamentalsQuery | EstimatesQuery | HoldingsQuery | OwnershipQuery | CorporateActionsQuery |
+         SharesQuery | ResearchQuery | StatementsQuery | EventsQuery | NewsRecordsQuery | NewsArticleQuery |
+         CompanyQuery | FinancialArchiveQuery | YahooPricesQuery)

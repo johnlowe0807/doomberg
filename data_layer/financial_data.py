@@ -3,32 +3,22 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import replace
-from datetime import date, datetime, timezone
+from datetime import date
 
 from .financial_fields import METRICS, raw, values
 from .query_models import (FundamentalsQuery, EstimatesQuery, HoldingsQuery, FactsQuery,
                            ResourceQuery, Result, Metadata, TableBatch)
-from .tabular import Dataset, Field, clean
+from .tabular import Dataset, Field, normalize_record
+from . import field_values as scalar
+from .field_values import number
 
 
 def iso(value):
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        try:
-            return datetime.fromtimestamp(value, timezone.utc).isoformat()
-        except (ValueError, OverflowError, OSError):
-            return None
-    return str(value)
+    return scalar.timestamp(value)
 
 
 def provenance(meta):
     return dict(source=meta.source, fetched_at=iso(meta.fetched_at), observed_at=iso(meta.observed_at), freshness=meta.freshness.upper())
-
-
-def number(value, scale=1):
-    value = clean(raw(value), 'number')
-    return value * scale if value is not None else None
 
 
 def normalize_fundamentals(symbol, data, meta):
@@ -39,14 +29,15 @@ def normalize_fundamentals(symbol, data, meta):
         period_end = flat.get('mostRecentQuarter') if spec.period in ('ttm', 'latest_balance', 'latest_quarter') else None
         # Statement period end is not its publication date. Yahoo usually does not
         # supply publication timestamps; retain the fetch time and leave that unknown.
-        observed = flat.get('dateShortInterest') if spec.period == 'short_interest' else flat.get('regularMarketTime') if spec.period == 'snapshot' else None
+        observed = flat.get('regularMarketTime') if spec.period == 'snapshot' else None
         records.append(dict(symbol=symbol, metric=name, name=spec.title, value=normalized[name], unit=spec.unit,
-                            period=spec.period, period_end=iso(period_end), fiscal_year=None, filing_date=None,
+                            period=spec.period, period_end=scalar.calendar_date(period_end), fiscal_year=None, filing_date=None,
+                            observed_date=scalar.calendar_date(flat.get('dateShortInterest')) if spec.period == 'short_interest' else None,
                             currency=(flat.get('currency') if spec.unit == 'currency/share' or spec.period == 'snapshot' else flat.get('financialCurrency'))
                                      if spec.unit.startswith('currency') else None,
                             is_estimate=spec.period == 'forward_estimate', **provenance(meta)))
         records[-1]['observed_at'] = iso(observed)
-    return records
+    return canonical_records(records, 'fundamentals')
 
 
 def normalize_estimates(symbol, data, meta):
@@ -55,7 +46,7 @@ def normalize_estimates(symbol, data, meta):
     common = {key: number(financial.get(spec.key)) for key, spec in METRICS.items() if key.startswith('target_') or key in ('analyst_count', 'recommendation_mean')}
     common['recommendation'] = financial.get('recommendationKey')
     for item in (data.get('earningsTrend') or {}).get('trend', []):
-        row = dict(symbol=symbol, kind='estimate', period=item.get('period'), period_end=item.get('endDate'),
+        row = dict(symbol=symbol, kind='estimate', period=item.get('period'), period_end=scalar.calendar_date(item.get('endDate')),
                    is_estimate=True, **common, **provenance(meta))
         for block, prefix, fields in (
             ('earningsEstimate', 'eps_', {'avg':'mean', 'low':'low', 'high':'high', 'yearAgoEps':'year_ago', 'numberOfAnalysts':'analysts', 'growth':'growth'}),
@@ -81,16 +72,17 @@ def normalize_estimates(symbol, data, meta):
                             [('strong_buy','strongBuy'),('buy','buy'),('hold','hold'),('sell','sell'),('strong_sell','strongSell')]}, **provenance(meta)))
     for item in (data.get('upgradeDowngradeHistory') or {}).get('history', []):
         records.append(dict(symbol=symbol, kind='rating_change', period=None, period_end=None, date=iso(item.get('epochGradeDate')),
+                            event_at=iso(item.get('epochGradeDate')),
                             firm=item.get('firm'), from_grade=item.get('fromGrade'), to_grade=item.get('toGrade'),
                             action=item.get('action'), is_estimate=True, **provenance(meta)))
-    return records
+    return canonical_records(records, 'analysts')
 
 
 def normalize_holdings(symbol, data, meta):
     block = data.get('topHoldings') or {}
     profile = data.get('fundProfile') or {}
     currency = (data.get('price') or {}).get('currency')
-    report_date = iso(block.get('reportDate') or block.get('holdingsDate'))
+    report_date = scalar.calendar_date(block.get('reportDate') or block.get('holdingsDate'))
     records = []
 
     def append(kind, name, *, holding=None, weight=None, value=None, unit=None, reported=None):
@@ -101,7 +93,7 @@ def normalize_holdings(symbol, data, meta):
     for item in block.get('holdings', []):
         if item.get('symbol'):
             append('holding', item.get('holdingName') or item['symbol'], holding=item['symbol'],
-                   weight=number(item.get('holdingPercent'), 100), reported=iso(item.get('reportDate')))
+                   weight=number(item.get('holdingPercent'), 100), reported=scalar.calendar_date(item.get('reportDate')))
     for key, name in [('cashPosition','Cash'),('stockPosition','Equities'),('bondPosition','Bonds'),
                       ('preferredPosition','Preferred'),('convertiblePosition','Convertible'),('otherPosition','Other')]:
         value = number(block.get(key), 100)
@@ -122,7 +114,7 @@ def normalize_holdings(symbol, data, meta):
         if value is not None:
             percent = name in ('annualReportExpenseRatio','annualHoldingsTurnover')
             append('fund_metric', name, value=value * 100 if percent else value, unit='percent' if percent else 'provider_value')
-    return records
+    return canonical_records(records, 'holdings')
 
 
 async def snapshot(service, query, *, force=False, stored_only=False):
@@ -140,7 +132,7 @@ async def snapshot(service, query, *, force=False, stored_only=False):
         operation, kind, ttl, normalize = 'estimate-data', 'analyst_estimates', 3600, normalize_estimates
     else:
         operation, kind, ttl, normalize = 'holdings-data', 'fund_holdings', 86400, normalize_holdings
-    identity = 'financial-v3:' + service.identity(query)
+    identity = 'financial-v4-' + scalar.VERSION + ':' + service.identity(query)
 
     async def load(refresh):
         if isinstance(query, FundamentalsQuery) and query.source == 'sec':
@@ -181,13 +173,45 @@ async def snapshot(service, query, *, force=False, stored_only=False):
                 result = rebuilt
         except ValueError as error:
             result = Result(None,replace(result.meta,reason=str(error)))
+    if result.data is None:
+        # Older installations may retain only normalized records after source
+        # document eviction. Upgrade those locally without inventing fetch times.
+        try:
+            legacy = await asyncio.to_thread(service.repository.get, 'financial-v3:' + service.identity(query))
+        except Exception:
+            legacy = None
+        if legacy:
+            dataset = {'fundamental_metrics':'fundamentals','analyst_estimates':'analysts','fund_holdings':'holdings'}[kind]
+            rows = []
+            for original in legacy[0]:
+                row = dict(original)
+                if dataset == 'fundamentals' and row.get('source') == 'sec':
+                    row['observed_date'] = scalar.calendar_date(row.get('observed_at'))
+                    row['observed_at'] = None
+                if row.get('kind') == 'rating_change':
+                    row['event_at'] = row.get('date')
+                rows.append(row)
+            rows = await asyncio.to_thread(canonical_records, rows, dataset)
+            meta = replace(legacy[1], freshness='stale', reason='Upgraded retained financial records; source document unavailable')
+            try:
+                saved = await asyncio.to_thread(service.repository.put, identity, kind, legacy[1].source,
+                                                rows, legacy[1].fetched_at, legacy[1].observed_at)
+                result = Result(saved[0], replace(meta, version=saved[1].version, cache='store'))
+            except Exception:
+                from .serialization import key
+                result = Result(rows, replace(meta, version=key(rows), cache='session-only',
+                                              reason=meta.reason + '; persistence failed, using session-only records'))
     if result.data is not None:
+        try:
+            await asyncio.to_thread(service.repository.capture_financial,kind,result.data,result.meta.fetched_at,result.meta.source)
+        except Exception as error:
+            service.warn(f'Financial capture archive unavailable: {type(error).__name__}; current data retained')
         return Result([dict(row, freshness=result.meta.freshness.upper()) for row in result.data], result.meta, result.inputs)
     return result
 
 
-COMMON = {'symbol':Field('text','Ticker'), 'source':Field('text','Source'), 'freshness':Field('text','Freshness'),
-          'observed_at':Field('text','Observed UTC'), 'fetched_at':Field('text','Fetched UTC')}
+COMMON = {'symbol':Field('text','Ticker'), 'source':Field('text','Source', normalizer=scalar.source), 'freshness':Field('text','Freshness'),
+          'observed_at':Field('timestamp','Observed UTC'), 'fetched_at':Field('timestamp','Fetched UTC')}
 
 
 def validate_table(query, dataset):
@@ -228,31 +252,50 @@ async def execute_table(service, query, dataset, required, force, stored_only):
     return Result(data, meta, (result.meta,))
 
 
-def register(service):
+def schemas():
     fundamental = dict(COMMON, metric=Field('text','Metric'), name=Field('text','Name'), value=Field('number','Value'),
-        unit=Field('text','Unit'), period=Field('text','Period'), period_end=Field('text','Period End'),
-        fiscal_year=Field('number','Fiscal Year'), filing_date=Field('text','Filed'), currency=Field('text','Currency'),
+        unit=Field('text','Unit'), period=Field('text','Period'), period_end=Field('date','Period End'),
+        fiscal_year=Field('number','Fiscal Year'), filing_date=Field('date','Filed'), observed_date=Field('date','Observed Date'),
+        currency=Field('text','Currency', normalizer=scalar.currency, case_sensitive=True),
         is_estimate=Field('boolean','Estimate'))
-    estimate = dict(COMMON, kind=Field('text','Kind'), period=Field('text','Period'), period_end=Field('text','Period End'),
-        currency=Field('text','EPS Currency'), revenue_currency=Field('text','Revenue Currency'),
+    estimate = dict(COMMON, kind=Field('text','Kind'), period=Field('text','Period'), period_end=Field('date','Period End'),
+        currency=Field('text','Currency (EPS / Price Target)', normalizer=scalar.currency, case_sensitive=True), revenue_currency=Field('text','Revenue Currency', normalizer=scalar.currency, case_sensitive=True),
         recommendation=Field('text','Recommendation'), is_estimate=Field('boolean','Estimate'),
-        date=Field('text','Date'), firm=Field('text','Firm'), from_grade=Field('text','From'), to_grade=Field('text','To'), action=Field('text','Action'))
+        date=Field('timestamp','Rating Changed UTC (alias)'), event_at=Field('timestamp','Rating Changed UTC'),
+        firm=Field('text','Firm'), from_grade=Field('text','From'), to_grade=Field('text','To'), action=Field('text','Action'))
     numeric = ['eps_mean','eps_low','eps_high','eps_year_ago','eps_growth','eps_analysts','revenue_mean','revenue_low','revenue_high',
                'revenue_year_ago','revenue_growth','revenue_analysts','eps_current','eps_7d_ago','eps_30d_ago','eps_60d_ago','eps_90d_ago',
                'eps_up_7d','eps_up_30d','eps_down_7d','eps_down_30d','stock_growth','industry_growth','sector_growth','index_growth',
                'target_mean','target_median','target_low','target_high','analyst_count','recommendation_mean',
                'strong_buy','buy','hold','sell','strong_sell']
-    estimate.update({name:Field('number',name.replace('_',' ').title(),unit='percent' if 'growth' in name else '') for name in numeric})
+    def unit(name):
+        if 'growth' in name:
+            return 'percent'
+        if name in ('analyst_count','eps_analysts','revenue_analysts') or name.startswith(('eps_up_', 'eps_down_')) or name in ('strong_buy','buy','hold','sell','strong_sell'):
+            return 'count'
+        if name == 'recommendation_mean':
+            return 'rating'
+        return 'currency/share' if name.startswith(('eps_', 'target_')) else 'currency'
+    estimate.update({name:Field('number',name.replace('_',' ').title(),unit=unit(name)) for name in numeric})
     holdings = dict(COMMON, fund=Field('text','Fund'), kind=Field('text','Kind'), name=Field('text','Name'),
         weight=Field('number','Weight %',unit='percent'), value=Field('number','Value'), unit=Field('text','Unit'),
-        currency=Field('text','Currency'), report_date=Field('text','Reported'))
+        currency=Field('text','Currency', normalizer=scalar.currency, case_sensitive=True), report_date=Field('date','Reported'))
     definitions = {
         'fundamentals':(fundamental,('metric','value','unit','period','period_end','currency','source'),('symbol','metric','name')),
         'estimates':(estimate,('period','period_end','eps_mean','eps_growth','eps_analysts','revenue_mean','revenue_growth','currency'),('symbol','period')),
-        'analysts':(estimate,('kind','date','firm','from_grade','to_grade','target_mean','recommendation'),('symbol','kind','firm','to_grade')),
+        'analysts':(estimate,('kind','event_at','firm','from_grade','to_grade','target_mean','recommendation'),('symbol','kind','firm','to_grade')),
         'holdings':(holdings,('kind','symbol','name','weight','value','unit','report_date'),('symbol','fund','name','kind')),
     }
-    for name,(fields,defaults,search) in definitions.items():
+    return definitions
+
+
+def canonical_records(records, dataset):
+    fields = schemas()[dataset][0]
+    return [normalize_record(row, fields) for row in records]
+
+
+def register(service):
+    for name,(fields,defaults,search) in schemas().items():
         service.register_table(name, Dataset(fields,defaults,search,None,execute_table,validate_table))
 
 

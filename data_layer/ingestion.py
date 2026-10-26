@@ -177,6 +177,9 @@ class Ingestion:
         if authenticated:
             self.yahoo_session.check()
         def fetch():
+            if op.startswith('plug-'):
+                from .yahoo_plugs import fetch as fetch_plug
+                return fetch_plug(op, p)
             import yfinance as yf
             symbol = p.get('symbol')
             ticker = yf.Ticker(symbol) if symbol else None

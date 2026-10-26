@@ -2,7 +2,7 @@
 from datetime import date
 
 from .financial_fields import METRICS
-from .financial_data import provenance, number
+from .financial_data import provenance, number, canonical_records
 
 CONCEPTS = {
     'revenue': ('RevenueFromContractWithCustomerExcludingAssessedTax','Revenues','SalesRevenueNet','RevenueFromContractWithCustomerIncludingAssessedTax'),
@@ -135,5 +135,6 @@ def normalize(symbol, data, meta, as_of=None):
             period=item[2] if item else spec.period,period_end=fact.get('end'),fiscal_year=fact.get('fy'),
             filing_date=fact.get('filed'),currency=currency if spec.unit.startswith('currency') else None,
             is_estimate=spec.period == 'forward_estimate',**provenance(meta)))
-        result[-1]['observed_at'] = fact.get('filed')
-    return result
+        result[-1]['observed_at'] = None
+        result[-1]['observed_date'] = fact.get('filed')
+    return canonical_records(result, 'fundamentals')
