@@ -21,6 +21,15 @@ Use `AND`, `OR`, `NOT` and parentheses. Quote text and tickers: `symbol = 'BRK.B
 Text comparisons ignore case. Missing values need `IS NULL`; `!=` does not match missing values.
 A dot-command chain validates as a whole before changing settings.
 
+Dates (`period_end`, `filing_date`, `report_date`, `observed_date`) use `YYYY-MM-DD`.
+Timestamps (`observed_at`, `fetched_at`, analyst `event_at`) use UTC ISO instants; filters accept
+an explicit offset/Z or epoch seconds. They compare chronologically, with missing values last.
+Analyst `date` remains an alias for `event_at`. SEC filing dates and short-interest observation dates
+do not imply a known observation time. Currency codes preserve minor units: GBp is pence, GBP is pounds.
+Enter on METRICS/EST/ANALYST/HOLD opens the full selected record, including fields omitted from the table.
+q/Esc returns to the same query/selection; Shift+Enter opens the selected security's price graph.
+Details use the existing record; they do not supply new metric/target histories or new data sources.
+
 ```text
 /EQUITY .WHERE market_cap > 1000000000000 AND roe > 15 .SORT market_cap DESC .FIELDS symbol,price,roe,debt_equity .LIMIT 20
 /FUTURES .SORT volume DESC .FIELDS symbol,name,price,volume,currency

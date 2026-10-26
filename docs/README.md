@@ -41,6 +41,11 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
   Yahoo estimates/targets are current snapshots, not historical estimates. Holdings may cover only reported top positions;
   HOLD also includes sector/asset allocations, bond metrics and fees. Unknown reporting dates remain N/A and ambiguous
   provider statistics retain their provider units. CLEAR preserves the selected security/source/date.
+  Enter opens details for the selected metric, analyst record, estimate or holding, including fields omitted by FIELDS.
+  q/Esc returns to the same table/selection; Shift+Enter on the table opens its security price graph.
+  Details reuse the loaded record, including available target ranges, rating counts and EPS revisions.
+  Shared data-layer normalization keeps calendar dates (`YYYY-MM-DD`) separate from UTC timestamps.
+  Date filters/sorts are chronological; timestamps accept ISO offsets/Z or epoch seconds. Currency units retain GBp/GBP distinctions.
 - An uppercase letter opens the command line for a ticker (`AAPL`); `/` opens it for a command
   (`/WEI`, `/GC`, `/FA AAPL`, `AAPL /FA`, `/COMP SPY QQQ`, `/? apple`). Commands require `/`;
   bare words always select symbols in the primary line. The graph popup uses bare commands instead. Press `?` or run `/HELP` for help.
@@ -92,7 +97,7 @@ python3.11 -m venv .venv && .venv/bin/pip install -e .
 - Layout: `Ctrl+1/2/4`, or `/LAYOUT 1|2|4` (macOS Terminal doesn't send Ctrl+digit).
 - Charts automatically use pixel graphics in iTerm2 (Sixel) and Kitty, with text fallback elsewhere.
   Candles, indicator curves, and MACD histograms use pixel geometry independent of terminal text size.
-  Price, comparison, rates/spreads, Treasury curve, and earnings charts share the same scene model.
+  Price, comparison, rates/spreads, Treasury curve, and earnings charts use the reusable `terminal_plot` library.
   In `[chart]`, `renderer = "auto"` can be overridden with `"text"`, `"sixel"`, or `"tgp"` (restart to apply).
   `font_px = 0` follows terminal cell height; a positive value sets the raster label size.
   `font_path` can point to your terminal font file (macOS defaults to Menlo); text charts use the terminal font.
@@ -176,3 +181,148 @@ content, two million OHLCV rows total, 100,000 observations per series, two year
 64 MiB budget (1,000/512 entries); expired responses and 30-day analysis results are removed.
 SQLite overhead/WAL files can temporarily exceed these logical budgets. Settings/watchlists
 are preserved; legacy JSON caches are left untouched and are no longer read.
+
+### Additional Yahoo data APIs (terminal integration deferred)
+
+Use `await hub.query(request)` with classes from `data_layer.query_models`:
+
+| Request | Normalized data / TableQuery dataset |
+| --- | --- |
+| `OwnershipQuery(symbol)` | Major, institutional, fund and insider ownership/transactions/purchases; `ownership` |
+| `CorporateActionsQuery(symbol, start, end)` | Dividends, splits, capital gains; `actions` |
+| `SharesQuery(symbol, start, end)` | Historical share-count observations; `shares` |
+| `ResearchQuery('sector'\|'industry', key, region='US')` | Overviews, weights, companies, fund lists, performance and report metadata; `research` |
+| `StatementsQuery(symbol, 'income'\|'balance'\|'cashflow', 'annual'\|'quarterly'\|'ttm')` | Long-form accounting records; `statements` |
+| `EventsQuery(kind, start, end, symbol=None, region=None, max_pages=4)` | Earnings, IPOs, economic releases, splits, per-security dividends; `events` |
+| `NewsRecordsQuery(symbols=(), text='', start=None, end=None, limit=100)` | Yahoo feeds/search, security links and deduplicated articles; `articles` |
+| `NewsArticleQuery(article_id)` | Retained Yahoo body or summary; no publisher request or sentiment |
+| `CompanyQuery(symbol, dataset)` | `profile`, `filings`, `earnings_history`, `sustainability`; `company` |
+| `FinancialArchiveQuery(symbol, dataset='estimates', as_of=None)` | Collected fundamentals/estimates/holdings snapshots; `financial_archive` |
+| `YahooPricesQuery(symbols, start=None, end=None)` | Captured stream observations or stored Yahoo quote fallback; `yahoo_prices` |
+
+All table datasets support the existing typed WHERE/SEARCH/SORT/FIELDS/LIMIT engine. Supply request arguments
+through `TableQuery.parameters`; inspect `hub.queries.table_dataset(name).fields` for types and units.
+These are backend APIs; no terminal commands, pages, settings or existing feeds were changed in this batch.
+
+```python
+from data_layer.query_models import EventsQuery, NewsRecordsQuery, TableQuery, Condition
+events = await hub.query(EventsQuery('economic', '2026-10-26', '2026-10-31', region='US'))
+news = await hub.query(NewsRecordsQuery(('AAPL', 'MSFT')))
+ownership = await hub.query(TableQuery('ownership', where=Condition('weight', '>', 5),
+                                     parameters={'symbol': 'AAPL'}), stored_only=True)
+stream = await hub.queries.start_yahoo_stream(['BTC-USD', 'EURUSD=X'])  # opt-in
+# ... query YahooPricesQuery or pass on_record=callback when starting the stream ...
+await stream.stop()
+```
+
+Date windows are start-inclusive/end-exclusive. Calendar dates remain separate from fixed-precision UTC
+instants; session/date-only schedules have no invented exact event time. Original timezone, scheduled time,
+period/report dates, collection time and conservative availability remain distinct. Profile epoch fields also
+have typed timestamp values. Unchanged records retain first availability; corrections start a new availability.
+Percentages use percentage points; monetary amounts retain currency; unknown economic/quote units remain explicit.
+
+`Metadata.complete`, `coverage` and `reason` describe bounds, duplicates and failures. Calendars page sequentially
+(100 rows/page; default four, maximum twenty); completeness covers Yahoo's returned scope only. News discovery
+uses at most 100 items per source/25 securities, then queries retained articles. Missing dates/values stay null.
+Yahoo currently supplies no retrospective estimate/holdings archive here: capture cutoffs refer to locally collected
+snapshots, not fiscal/report dates. The ESG endpoint returned 404 during live checks and remains explicitly unavailable.
+
+Schema v4 adds indexed domain records, financial captures and stream observations. Raw documents support offline
+normalization rebuilding; compatible stored event/share windows can be reused without fetching. Captures retain
+up to ten years/10,000 snapshots/128 MiB; stream ticks retain up to 90 days/200,000 records. These budgets supplement
+the existing dataset/cache budgets. Streams reconnect/resubscribe, persist off-thread, expose buffer drops and label
+old observations DLY/STALE; transport activity does not imply exchange-grade coverage.
+
+## Reusable terminal plots
+
+`terminal_plot` takes supplied data and drawing instructions; it performs no fetching or statistical calculations.
+It supports line, area, scatter (including supplied group labels), bar, candle and OHLC series, vertical subplots,
+left/right axes, independent comparison scales, guides, crosshairs and explicit limits/log scales. Numeric x values
+retain their spacing. Categories retain encounter order; datetime coordinates use UTC. Set `Axes(xkind='datetime')`
+for normalized ISO dates/timestamps or epoch seconds. Timestamp strings and Python datetimes need an offset/timezone;
+calendar dates use midnight UTC. Nonfinite coordinates leave gaps. Submitted figures copy their arrays so later
+caller mutations cannot change queued frames. All native OHLC rows are drawn without aggregation.
+
+```python
+from rich.console import Console
+from terminal_plot import subplots, render_text, render_image
+
+figure, axes = subplots(title='Supplied clusters')
+axes.xlabel, axes.ylabel = 'Feature 1', 'Feature 2'
+axes.scatter([0, 1, 10, 11], [1, 2, 8, 9], groups=['A', 'A', 'B', 'B'])
+axes.scatter([.5, 10.5], [1.5, 8.5], label='Centers', marker='cross', color='#FFFFFF')
+Console().print(render_text(figure, (100, 30)))
+render_image(figure, (1000, 600)).save('/tmp/clusters.png')
+# Inside FreeTerm: chart_surface.submit(figure) uses the existing text/Sixel/Kitty transport.
+```
+
+Declarative callers can construct `Figure`, `Axes`, `Series` and `Guide` directly. `subplots(rows=2)` returns a
+figure and a list of axes; set `figure.sharex = True` for aligned x domains. Rendering returns a Rich `Text` or Pillow
+image. Terminal text provides coarse stroke/marker sizes; raster output applies pixel sizes. The existing financial
+`Scene` adapter remains in `freeterm/pixelcharts.py`; navigation, data preparation and calculations stay in the views.
+No new terminal commands or data integrations are introduced by this plotting change.
+
+```bash
+.venv/bin/python -m terminal_plot.demo                       # offline cluster example in terminal
+.venv/bin/python -m terminal_plot.demo --png /tmp/clusters.png
+.venv/bin/python -m unittest discover -s tests -p test_plotting.py -v
+```
+
+## Normalized extraction and calculations
+
+`/DATA` lists all registered datasets and their complete field schemas/parameters. Open any with
+`/DATA dataset [symbol] [_parameter=value ...]`. `/EXTRACT` carries the active screen's query/context into
+this common client. On specialized screens, `.WHERE`, `.FIELDS`, `.CALC`, `.PIVOT`, `.STATS` and `.EXPORT`
+open the same extraction client; Esc returns to the specialized layout. Existing table filters still work.
+
+```text
+/DATA reporting AAPL _statement=balance
+.WHERE metric IN ('assets','liabilities','stockholders_equity')
+.PIVOT metric value BY symbol,period_end
+.CALC debt_ratio = liabilities / assets
+.SORT period_end DESC
+.FIELDS symbol,period_end,assets,liabilities,debt_ratio
+.EXPORT "/tmp/balance-ratios.json"
+```
+
+`reporting` exposes every SEC concept/unit eligible at the selected filing-date cutoff, selecting the latest
+filing per actual concept/period. `facts` retains all reported filings/amendments, taxonomy, original concepts,
+units, period starts/ends, filing dates and accessions; extraction is not limited to FA's display rows or the
+41 predefined metrics. SEC instant facts are accessible as balance data; SEC duration concepts remain
+unclassified by statement. For provider-classified statements with every Yahoo line item, use
+`/DATA statements AAPL _statement=balance _period=annual` (also income/cashflow, quarterly/TTM where supported).
+`/DATA reporting AAPL _source=yahoo _statement=balance` includes annual and quarterly statement records.
+`statement_values` exposes the exact shared FA annual/quarterly calculations, including standalone quarters
+and free cash flow, as unscaled numbers. It preserves FA's USD convention; facts/reporting/statements retain
+native-currency source records and all unlisted concepts. `/EXTRACT` from FA preserves the selected statement
+and annual/quarterly mode. Actual fiscal periods remain separate from filing-context FY/FP metadata.
+Known cross-provider metric aliases retain original provider fields and naming-basis metadata; unmatched
+concepts retain normalized provider names, signs and units. Raw facts retain forward-dated disclosures;
+current reporting excludes future measurement periods.
+
+All existing registered financial, ownership, actions, shares, research, events, articles, company, captures
+and Yahoo-price fields are queryable. Added access covers native prices, FRED series, quotes, filings, news,
+full option chains and shared Greeks, available book levels, auctions, comparisons, selected-range statistics,
+technical indicators, ticker calendars, FRED metadata/notes, search and readable documents. `profile_fields` and `source_fields` retain provider
+scalar paths/types, including fields without canonical meanings; their unknown units stay explicit.
+Use `source_fields _operation=estimate-data`, `holdings-data`, `fundamental-data` or another listed existing
+operation for original provider fields beyond the normalized schemas. No new providers are introduced.
+
+Commands execute in written order. `.STATS value BY metric` produces count/missing/sum/mean/min/max/sample
+standard deviation, preserving security/source/period/unit/currency partitions. `.CALC` supports arithmetic,
+abs/sqrt/log/coalesce, date functions and explicitly ordered lag/diff/pct_change. Nulls and zero denominators
+stay null. Pivots retain fiscal periods, currencies, source/taxonomy and input filing/availability lineage;
+duplicate cells and incompatible unit additions are errors. Calendar dates never become invented instants.
+
+Leading WHERE/SEARCH/LIMIT applies before retrieval limits. DATA starts at 10,000 rows; EXTRACT preserves the
+active table's selection limit. The safety cap is 10,000 input rows, with provider budgets/partial coverage
+still explicit. Later LIMIT operations act where written. The terminal displays at most 1,000 selected rows;
+exports retain the entire selected result. `.EXPORT` creates JSON with schemas/coverage/provenance, or CSV
+with an adjacent `.csv.meta.json`; existing files are never overwritten. `?` lists every source field and
+current output field. FIELDS * exposes all available fields at that pipeline stage.
+
+Programmatic access uses `hub.query(ExtractQuery(TableQuery(...), steps=(DataStep(...), ...)))`.
+`data_layer.extraction.to_frame(result)` returns numeric/boolean nullable pandas columns, UTC instant columns,
+calendar-date objects and schema/provenance attributes. `stored_only=True` uses retained source records;
+missing archives remain unavailable. Exported reporting data describes collected/provider coverage and does
+not imply original-publication precision or a complete historical point-in-time archive.

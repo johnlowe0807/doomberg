@@ -14,11 +14,16 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 | `storage.py` | Versioned SQLite domain repositories and separate disposable response/analysis caches |
 | `query.py` | Async typed query/feature services, freshness policies, shared ingestion, explicit fallback and versioned worker analysis |
 | `analytics.py` | Pure existing technical indicator calculations, consumed by worker analysis |
+| `../data_layer/access.py` | Normalized adapters for legacy source data, full SEC facts/reporting, FA values, calendars, option chains/Greeks, prices/series/statistics/indicators, books, auctions, FRED metadata and provider scalar paths |
+| `../data_layer/reporting.py` | Shared fiscal statement matrix, standalone-quarter and free-cash-flow calculations used by FA and extraction |
+| `../data_layer/extraction.py` | Typed ordered extraction over table queries; unit-aware arithmetic, pivots, windows/summaries, coverage/provenance, JSON/CSV exports and nullable quant DataFrames |
+| `datasets.py` | Shared DATA catalog/client, complete field/parameter discovery, query/calculation commands, full-record details and EXTRACT context routing |
 | `discovery.py`, `fred_discovery.py`, `catalog.py` | Bounded discovery ingestion, indexed selection, FRED query syntax and offline seeds |
 | `app.py` | `FreeTerm` app, command parser, `Pane` (per-pane Esc history), `View` base, `MonView`, `HelpView`/`HelpScreen` (`?`), `PromptScreen`, NYSE holidays, stream startup |
 | `dialogs.py` | Shared buttonless `ConfirmScreen` styling and cancel keys, plus `QuitConfirm`. Browser confirmation subclasses the same dialog. |
 | `charts.py` | `ChartView` (GP) + `GIPView`, `CompView`, `FredView`, `SprdView`, `QuoteChartView` (bare security). Indicators (SMA/EMA/BB/VWAP/RSI/MACD), FRED CSV fetch, IEX banner and overlay |
-| `pixelcharts.py` | Shared `Scene`/`Panel`/`Trace` model (including independent per-series scales on the left), pixel geometry rasterizer, Sixel/Kitty transport, text fallback, queued worker rendering and pane-local image cleanup |
+| `../terminal_plot/` | Provider-independent `Figure`/`Axes`/`Series`/`Guide` plotting library; numeric/category/UTC datetime coordinates, grouped scatter, curves/areas/bars/OHLC, Pillow and Rich/plotext renderers, offline cluster demo |
+| `pixelcharts.py` | Existing `Scene`/`Panel`/`Trace` adapter to `terminal_plot`, Sixel/Kitty/text transport, queued worker rendering, detached submission snapshots and pane-local image cleanup |
 | `graph_commands.py` | Shared graph/options command popup, scoped HELP/completion, main-line dispatch, indicators, comparison modes, IEX, windows/intervals and GOTO |
 | `chart_navigation.py` | Validated GOTO date/offset requests and containing-candle/native-observation lookup |
 | `boards.py` | `QuoteBoard` (WEI), CMDTY, CRYPTO, MOST, FXC matrix, HOME, GC, BTMM, AUCT, `IexView` (IEX toggle) |
@@ -36,7 +41,9 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 
 ## Gotchas learned the hard way
 - Shift+Left/Right bisects remembered lower/upper bounds, initially the visible walls. Direction reversals use prior pivots; plain arrows, GOTO and view changes restart the search. Ctrl+arrows are left to macOS desktop navigation.
-- All chart views build geometry scenes; `ChartSurface` handles transport. Auto uses Sixel/Kitty where detected, with
+- Existing chart views build financial scenes, translated into `terminal_plot.Figure`; `ChartSurface` also accepts
+  supplied generic figures directly. The library fetches nothing and computes no statistics. `render_text` returns Rich
+  text with isolated plotext state; `render_image` returns a Pillow image without a running app. Auto uses Sixel/Kitty where detected, with
   text fallback elsewhere and in headless tests. Configure `[chart].renderer`, `font_px` (0 matches reported terminal cell width/height) and optional `font_path` for raster labels. Text charts use the terminal font; raster defaults to Menlo on macOS. Axis labels use bright foreground text.
 - `.` opens graph commands. `.IND`, `.CMP`, `.TIME` and `.SIZE` route from the main bar to the active graph,
   while the HOME mini chart is fixed at 1D/5m and excludes graph commands. IEX remains global and requires validated keys; the popup toggles it without navigation.
@@ -67,8 +74,9 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
 - Scene sizing fields are line width, point radius, candle width fraction and font size. Pixel rendering applies them
   to curves/candle close markers/bodies; text fallback provides coarse stroke/point markers. Comparison timers never patch normalized frames as OHLC.
 - **plotext subplots broadcast.** The text fallback must draw on individual panel objects after `subplots()`.
-  `pixelcharts.render_text` also gives every panel the same x-range and y-label width; pixel panels share plot bounds.
-- `PlotextPlot.render` is wrapped in `charts.py` (`_safe_render`), so a plotext exception shows a message instead of crashing.
+  `terminal_plot.render_text` gives shared panels the same x-range and y-label width; pixel panels share plot bounds.
+- `pixelcharts._TerminalPlot` catches render failures within each chart surface; there is no global `PlotextPlot.render`
+  monkey patch. A plotext exception shows a message and status warning instead of crashing.
 - Pane focus: Tab/Shift+Tab are **priority** app bindings, because Screen's built-in focus_next would otherwise win. The
   command line is outside the panes, so `App.active_pane()` remembers the last focused pane (`mark_active`, `.active` CSS class).
 - The command Input uses `select_on_focus=False`. Otherwise the first typed letter, inserted when focus jumps, gets replaced.
@@ -93,6 +101,74 @@ smoke test (`tests/smoke.py`). What's left is polish and verification, listed un
   `BadVol`. The chart then says "N bad Yahoo volume prints hidden". Don't apply it to 5m (clean) or crypto (false positives).
 
 ## Query and storage contracts
+- `ExtractQuery(TableQuery(...), steps=(DataStep(...), ...), max_rows=10000, stored_only=False)` runs ordered
+  selection/projection, calculations, pivots and summaries in workers. Leading WHERE/SEARCH/LIMIT applies before
+  the retrieval cap; later operations retain their explicit order. DATA defaults to 10,000 source rows; EXTRACT
+  preserves the active table's selection limit. Source/provider scan budgets and incomplete coverage remain explicit.
+  `ExtractedData` contains the output TableData, Field schema, detached original request and structured input/output
+  coverage. No SQLite schema migration was needed; adapters rebuild from existing domain records/provider documents.
+- Reporting access is not restricted to the 41 metrics or FA display rows. `facts` retains SEC concept/taxonomy/unit,
+  filing/accession/frame, actual start/end dates, forward-period flags and filing-context FY/FP; actual fiscal FY/quarter
+  is inferred only from eligible fiscal anchors. `reporting` selects latest eligible actual-period records, with explicit
+  unclassified duration membership and conservative cross-provider aliases retaining original field names. Yahoo
+  statement fields/signs/currencies remain native; historical Yahoo as_of cutoffs are rejected. `statement_values`
+  shares FA's fiscal calculations, annual/quarterly mode, standalone quarters and FCF, preserving its USD convention;
+  full native-currency/unlisted source data remains in facts/reporting/statements. Known dates never imply exact instants.
+- DATA currently discovers 47 datasets and every registered field/parameter. Specialized views retain their layouts;
+  EXTRACT carries source context (including FA statement/frequency and OMON expiry) into the shared client. Advanced
+  dot commands and selection commands on specialized views open DATA. Each record can be inspected without new I/O.
+  The terminal caps displayed rows/cells; calculations and exports retain the full bounded selection. JSON exports
+  include schema/unit/currency/temporal descriptors, source versions, lineage and input/output coverage; CSV has a
+  metadata sidecar. Exports create new files only and reject stale result/request mismatches. `to_frame()` retains
+  nullable numbers/booleans, UTC instants, calendar-date objects and metadata for quant use.
+- CALC uses a bounded AST interpreter (no eval), propagates null/zero-division semantics and rejects incompatible
+  additions. Windows require explicit sort and partition by retained source/security/metric/unit/currency context.
+  Pivots preserve actual periods/source/taxonomy/currency and reject duplicate cells; filing/availability and input
+  lineage remain available. STATS uses retained semantic partitions and sample standard deviation. Native price/volume
+  units stay explicit when the provider's physical quote basis is unknown; no share/unit or FX conversion is invented.
+- `data_layer/field_values.py` owns canonical scalars (fields-v1): ISO calendar dates, fixed-precision UTC timestamp
+  strings, finite numbers, missing values, source/security-type aliases and currencies (GBp/GBP stay distinct).
+  Typed table fields now include date/timestamp; queries validate/canonicalize literals before I/O and compare/sort
+  normalized values. Timestamp literals require an offset/Z or epoch seconds; naive adapter timestamps require an
+  explicitly declared timezone. Low-level Quote/Metadata epoch timestamps and native OHLC/FRED indexes retain their contracts.
+  Financial adapters normalize before persistence; screen pages normalize before query evaluation. Financial record
+  identity v4 includes the scalar normalization version, and table result versions include it too. Existing raw source
+  documents rebuild upgraded records offline; retained v3 financial-only records also migrate, preserving fetch times/staleness.
+  That scalar normalization change required no physical migration. The subsequent Yahoo plug expansion uses schema v4 below.
+  Source documents retain original representations.
+- Additional Yahoo-only APIs are in `yahoo_datasets.py`, with pure schemas/parsers in `yahoo_records.py`, paced
+  transports in `yahoo_plugs.py` and indexed domain/capture storage in `record_store.py`. Typed requests cover
+  ownership/insiders, actions, shares, sector/industry research, statements, events, news/articles, company data,
+  financial captures and Yahoo prices. Registered table names: ownership/actions/shares/research/statements/events/
+  articles/company/financial_archive/yahoo_prices. This batch changes no terminal code/commands or existing feeds.
+  Existing legacy NewsQuery keeps its terminal-compatible shape; NewsRecordsQuery is the normalized Yahoo API.
+- New records use normalization-version-specific stores (currently yahoo-records-v5-fields-v1), typed calendar dates
+  and UTC instants, source timezone, per-row fetched_at/available_at and explicit availability basis. Dates, session
+  schedules and provider-encoded midnight filing/share dates never imply exact publication instants. scheduled_at
+  preserves the provider schedule separately from event_at. Unchanged records keep first availability; corrected
+  values start a new availability. Profile epoch fields use timestamp_value, not a numeric value column.
+  Numeric zeros survive calendar ingestion; percentages, ratios, counts and native/unknown units stay distinct.
+- SQLite schema v4 adds separate ownership/action/share/research/event/article/statement/company tables and indexes
+  for identifiers, dates and availability. Rolling action/share/statement/news records retain observations; force refresh
+  and versioned source-only offline rebuilding use the existing pipeline. Compatible stored event/share windows are
+  reusable across request ranges. Incompatible normalization versions are excluded from cross-window reads.
+  Metadata.complete/coverage/reason persist with domain records; capped, failed, duplicated or changing calendar pages
+  cannot imply completeness. Calendar max_pages is 4 by default, 20 maximum, 100 rows/page; earnings default to US.
+- Collected Yahoo financial snapshots are archived with original capture times; FinancialArchiveQuery(as_of=UTC instant)
+  selects a collected snapshot, never a fiscal/report-date approximation. No retrospective estimate/holdings provider
+  archive is claimed. Captures are bounded by ten years, 10,000 snapshots and 128 MiB. Article IDs use canonical URLs/
+  provider IDs rather than title-only deduplication; rows preserve security associations, publication precision,
+  summaries and any Yahoo-provided body. Article lookup never fetches a publisher or performs sentiment analysis.
+- `start_yahoo_stream(symbols, on_record=None)` is opt-in and returns a controller with set_symbols/stop/status.
+  `yahoo_stream.py` owns reconnect/backoff/resubscription, a bounded 2,000-record buffer and worker persistence.
+  YahooPricesQuery reads captured records (90 days / 200,000 ticks) or an explicit stored Yahoo quote fallback.
+  Receipt and source milliseconds are separate UTC instants; out-of-order ticks cannot replace the latest value.
+  Stopped/disconnected/old observations are STALE/DLY, unknown units stay explicit, and original packets are retained.
+- Financial table Enter opens a searchable full-record pager for METRICS/EST/ANALYST/HOLD, preserving query, period,
+  source/date context, row and focus. It uses retained rows independent of FIELDS and makes no extra provider request.
+  Shift+Enter explicitly opens the security price graph. Target ranges/counts, recommendation distributions, rating actions,
+  estimate revisions and available dates/provenance appear in details; unavailable histories/inputs are not fabricated.
+  Analyst event_at is canonical; date remains an alias. Date-only SEC/short-interest observations use observed_date.
 - `TableQuery(dataset, where, search, sort, fields, limit, parameters)` is the shared tabular API. `register_table(name, Dataset(...))`
   registers typed fields, defaults, search columns and an async loader or provider executor/validator; derived `Field` calculations declare dependencies
   and execute in workers. `tabular.py` owns validation, SQL three-valued predicates, nulls-last stable sorting and final
@@ -194,6 +270,65 @@ DES/HP/CN/TOP/OMON, FA (2,270 AAPL filings in FIL), ERN, EVTS, `/? apple`, an un
 MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default User-Agent.
 
 ## Completed updates
+- [x] Normalized data extraction and client (2026-10-25): added typed ExtractQuery/DataStep/ExtractedData and a
+      shared DATA/EXTRACT client over all 47 registered datasets. Every registered field/parameter is discoverable;
+      source scalar paths retain additional provider fields. Full SEC reporting concepts/units/filing contexts,
+      amendments/as-of selection, forward-period flags, native Yahoo statements and conservative canonical aliases
+      support extraction beyond the predefined metric/display lists. Moved FA fiscal statement/quarter/FCF calculations,
+      option Greeks and selected-range statistics into shared data-layer functions, exposing their numeric outputs.
+      Added normalized legacy adapters for prices, series/metadata, quotes, filings, news, options, books, auctions,
+      comparisons, ticker calendars, indicators, search and documents. Dates, instants, availability, native units,
+      currencies and actual versus filing fiscal periods remain explicit. Added ordered filtering/projection/math,
+      duplicate-safe pivots, explicit-sort windows, guarded summaries, raw JSON/CSV exports with metadata and quant-ready
+      nullable DataFrames. Specialized layouts remain available; commands open the common extraction client and preserve
+      source context. Exports preserve input/output coverage, original requests and pivot lineage, refuse overwrites,
+      and detect stale request/result mismatches. CPU normalization/calculation runs in workers.
+      Verified fixture behavior for source corrections/as-of cutoffs, all concepts, zero/null values, UTC/date precision,
+      dimensions/currency/period separation, safe AST rejection, windows, duplicate pivots, lineage, limits, exports,
+      nullable DataFrames and failed-command atomicity. Live checks passed 18 representative source adapters, all six
+      FA statement/frequency combinations plus FCF, Yahoo/SEC balance aliases, calendars, FRED metadata, both search
+      domains and nested raw fields. Stored-only extraction after restart made no ingestion calls. Headless client
+      checks passed active balance-sheet context, ratios, details, help at 80×24, export and parameter validation.
+      Actual CLI startup/confirmed exit, the full 27-command smoke, targeted DATA/FA/DAT/market-table smoke and all
+      15 existing plotting regression tests passed. Yahoo futures retained 49 usable rows with its existing overlapping
+      records/PARTIAL warning. Limits remain explicit: 10k extraction inputs, provider scan budgets, at most 1k displayed
+      rows with a cell budget; full selected exports are retained. FA's calculated matrix retains its USD convention;
+      full native-currency source records remain available separately. No new providers, trading or fabricated archives.
+- [x] Reusable terminal plotting library (2026-10-25): `terminal_plot` accepts supplied `Figure`/`Axes`/`Series`/`Guide`
+      instructions with numeric, categorical or UTC datetime coordinates, grouped scatter/center markers, lines,
+      areas, bars, candles/OHLC, subplots/shared domains, guides, log/dual axes and independent comparison scales.
+      Rendering produces Rich text or Pillow images without fetching or calculating statistics. Existing chart views
+      use it through a financial scene adapter; Sixel/Kitty transport, newest-frame queue, font sizing, fallback and
+      pane cleanup remain in `ChartSurface`. Removed the global plotext render monkey patch. No new data integrations
+      or terminal commands. Added an offline cluster demo and README API examples. All 15 offline regression tests
+      passed, including coordinate spacing, UTC/ISO inputs, category labels, missing-value gaps, snapshot isolation,
+      all chart primitives, eight scales, 1,000 native candles without aggregation, Sixel encoding, resize/error fallback
+      and obsolete-frame rejection. Actual CLI startup/confirmed exit, the full 27-command smoke, eight final chart
+      smoke commands and live keyboard/indicator checks passed. The full smoke exposed an existing futures partial-page
+      import error: moved `enrich` before the pagination loop and rechecked `/CMDTY` (49 usable rows; Yahoo overlapping
+      records remain explicitly PARTIAL). Physical Sixel/Kitty terminal QA remains open below.
+- [x] Additional Yahoo data plugs (2026-10-25): added ownership/insiders, corporate actions/share histories,
+      sector/industry research, annual/quarterly/TTM statements, market calendars, normalized Yahoo news/article
+      access, company/profile/filing/EPS data, collected financial captures and opt-in Yahoo streaming. Schemas,
+      date/time precision, availability/correction semantics, units, coverage and schema-v4 persistence are shared.
+      Verified 24 representative live dataset/capture queries, all 1,745 rows in the requested US earnings window,
+      62 economic events, 95 splits, news links/body fallbacks, restart/offline reuse and source-only rebuilding.
+      Unit/behavior checks covered zero values, timestamp offsets/precision, deduplication, stale/partial coverage,
+      capture cutoffs, correction/reversion availability, malformed/out-of-order ticks, reconnect/resubscription,
+      subscription changes and shutdown/restart. Live Yahoo ticks arrived for BTC/FX; closed-market symbols remained
+      explicit. IPO source duplicates were deduplicated with incomplete coverage flagged; ESG returned 404 and is
+      unavailable. Actual CLI startup/confirmed exit and the full 27-command live smoke passed without tracebacks
+      or unexpected provider errors. No terminal changes in this batch; broader market-hours streaming QA and
+      retrospective estimate/holdings backfill remain outside the available Yahoo coverage verified here.
+- [x] Field normalization and existing-record financial drill-down (2026-10-25): shared canonical scalars, typed
+      date/timestamp query fields, adapter normalization, explicit units/currency distinctions and versioned offline
+      upgrades. METRICS/EST/ANALYST/HOLD Enter opens full-record details without fetching; q/Esc restores the table,
+      query, selection and focus, and Shift+Enter explicitly opens a price graph. Verified UTC offsets/epoch/DST,
+      date validation, nulls, units/aliases, source-only and legacy-only offline rebuilding with original fetch times,
+      and six detail variants at 80×24 (including search/Escape, hidden fields and two-pane isolation). Actual CLI
+      startup/confirmed exit, the full 27-command live smoke and seven targeted financial/date commands passed.
+      Only the expected unknown-ticker warning occurred. No new sources or futures category field were added;
+      dataset visualization and richer metric-history/input views remain deferred.
 - [x] Functional chart binary search (2026-10-24): Shift+Left/Right remembers both search bounds and uses each previous cursor as the opposite bound, so reversals narrow the remaining interval (100 → 50 → 75 → 62). Wall no-ops preserve the interval; rounding converges to individual candles. State is per chart and resets on manual steps, GOTO, hiding/resetting the cursor, zoom/pan/range/interval/source/window changes; price-only updates preserve it. Updated hints, help and README. Verified 93,665 start/target combinations, keyboard reversal/reset behavior, native/comparison modes, CLI startup/confirmed exit and all 27 live smoke commands. Only expected unknown-ticker/missing-key messages occurred.
 - [x] Shift-arrow chart navigation (2026-10-24): replaced Ctrl+Left/Right with Shift+Left/Right for halfway jumps to avoid the macOS desktop shortcut. Updated chart hints, popup/global help and README. Verified Shift jumps, boundary convergence, unchanged plain-arrow steps, inactive Ctrl bindings and GOTO behavior; app startup/confirmed exit and all 27 live smoke commands passed with only expected unknown-ticker/missing-key messages.
 - [x] Graph labels and fast selection (2026-10-24): automatic raster font sizing matches monospace glyph advances/height to reported terminal cells; explicit font_px remains available. Removed stacked-scale font shrinking and fixed endpoint date-label collisions at larger sizes. The user's legacy 12px override was switched to auto (0). Ctrl+Left/Right halves the distance to the visible edge, rounds toward that edge and converges without crossing it. GOTO supports compact/ISO dates and times (New York unless offset/Z supplied), containing native candles (including calendar/right-labelled weekly buckets), LEFT/RIGHT counts or signed offsets, default visible-rightmost selection, bounded movement and panning that preserves zoom. Popup help/completion, main dot/slash routing, deferred initial loads and command chains are covered; invalid dates leave the current selection unchanged. Verified key behavior, boundary/gap/DST/date validation, zoom/pan, calendar intervals, popup/main routing, native-series/comparison selection and readable raster output. Actual app startup/confirmed exit, the full 27-command live smoke and seven additional live GOTO commands passed; only the expected unknown-ticker/missing-key messages occurred. Physical-terminal font/graphics QA remains open below.
@@ -230,11 +365,9 @@ MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default 
 - [x] Slash commands and symbol separation (2026-10-23): uppercase letters and `/` focus the command line; commands use `/`, security search uses `/? apple` or `/?apple`. Updated internal navigation, autocomplete, help, startup migration, and smoke inputs. App startup/exit and the full live-data smoke test passed (search returned 9 rows); focused headless checks passed for keyboard routing, ticker/command collisions, pane cycling, modal input, help, history, autocomplete, and startup migration. Alpaca remains untested without keys.
 
 ## Open items
-- [ ] Bedtime backlog notes (2026-10-24), detailed in `docs/claude-prompts/features-TODO-pt2.md` §7: keep analysis/metric
-      drill-down on the selected analysis and its available history/inputs; expose futures categories for shared filtering
-      and sorting; improve visualizations for expanded datasets; normalize equivalent fields, especially dates/timestamps,
-      in data-layer adapters so query commands and sorting semantics remain consistent across providers/security types.
-      Notes only; implementation remains pending.
+- [ ] Dataset visualizations from `docs/claude-prompts/features-TODO-pt2.md` §7 are deferred (2026-10-25).
+      Futures use existing queryable fields; the user requested no new category/classification field.
+      Field normalization and full-record financial details are covered by the 2026-10-25 update above.
 - [x] Yahoo 401 recovery and field reference (2026-10-24): coordinated anonymous cookie/crumb renewal after a final
       401, one recovery per minute, shared resource cooldowns (60s auth / 300s rate), and queued-worker checks prevent
       enrichment failure cascades. Login cookies remain intact; charts/history remain independent. Profiles/books now
@@ -255,8 +388,10 @@ MON and HOME. The Coinbase stream showed `cb:LIVE 12`. SEC accepted the default 
       and 80×24 UI/help. Live checks loaded AAPL estimates/targets/ratings, SPY's 10 reported positions/allocations/fees,
       2020 SEC metrics and market-wide financial filters. CLI startup/confirmed exit, the full 27-command live smoke and
       six targeted financial-view smoke commands passed. Historical Yahoo estimate/holdings archives are not supplied.
-- [ ] Continue `docs/claude-prompts/features-TODO-pt2.md` §§4–6 (local ignored TODO): remaining data additions, then better
-      calendars and news. Add yfinance live price streaming before any future trading capabilities.
+- [ ] Next: terminal feature/page refactor can consume the completed Yahoo data-layer APIs in
+      `docs/claude-prompts/features-TODO-pt2.md` §§4–6. Terminal integration and dataset visualizations are deferred.
+      Retrospective estimate/holdings backfill needs a verified source; wider market-hours Yahoo stream QA remains open.
+      No trading capabilities were added.
 - [x] Market-wide screener planning (2026-10-24): replaced every fixed-list screener with provider-wide query translation,
       server filtering/sorting, shared cached pages, bounded residual scans and separate ranking/count coverage. Preserved
       universal syntax, atomic validation and derived-field registration. Live checks covered all seven security types,
